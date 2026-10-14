@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 class Baseline:
@@ -161,25 +162,37 @@ def analyse_squeeze(pen, grip_load, free_load_std: float = 6.0, k_contact: float
     # Sudden yield: grip drops well below its running peak while the jaw keeps closing.
     # (A real skin split makes the jaw SURGE forward, so there are too few samples per
     # travel window for the slope test below to see it.) 5-sample median kills spikes.
-    fs = np.array([np.median(f[max(0, i - 4): i + 1]) for i in range(n)])
-    peak = -np.inf
-    for i in range(start, n):
-        peak = max(peak, fs[i])
-        drop = peak - fs[i]
-        if peak > thr and drop > drop_frac * peak and drop > 4 * free_load_std and pen[i] > pen[int(np.argmax(fs[start:i + 1])) + start]:
-            y = i
-            break
+    # Vectorised (no Python loops over samples): this runs every control tick.
+    fs = np.median(sliding_window_view(np.concatenate([np.full(4, f[0]), f]), 5), axis=1)
+    seg, pseg = fs[start:], pen[start:]
+    idx = np.arange(len(seg))
+    peak = np.maximum.accumulate(seg)
+    peak_at = np.maximum.accumulate(np.where(seg >= peak, idx, 0))
+    drop = peak - seg
+    hit = (peak > thr) & (drop > drop_frac * peak) & (drop > 4 * free_load_std) & (pseg > pseg[peak_at])
+    if hit.any():
+        y = start + int(np.argmax(hit))
     if y is None and k and k > 0:
-        end_fit = start + int(fit.sum())
-        run = 0
-        for i in range(end_fit, n):
-            w = (pen >= pen[i]) & (pen <= pen[i] + yield_ticks)
-            w[:i] = False
-            if pen[w].size and pen[w].max() - pen[i] < 0.8 * yield_ticks:
-                break                      # not enough travel left after i to judge
-            s = _slope(pen[w], f[w])
-            run = run + 1 if (s is not None and s < yield_ratio * k) else 0
-            if run >= yield_persist:
-                y = i - yield_persist + 1
-                break
+        # Gradual yield: least-squares slope over the next `yield_ticks` of travel from
+        # every sample i, all at once via prefix sums.
+        i0 = start + int(fit.sum())
+        pm = np.maximum.accumulate(pen)                  # monotone travel for the window search
+        ii = np.arange(i0, n)
+        jj = np.searchsorted(pm, pm[ii] + yield_ticks, side="right")
+        ok = jj < n                                      # enough travel after i to judge
+        ii, jj = ii[ok], jj[ok]
+        if len(ii):
+            c = lambda a: np.concatenate([[0.0], np.cumsum(a)])
+            Sx, Sy, Sxx, Sxy = c(pen), c(f), c(pen * pen), c(pen * f)
+            m = (jj - ii).astype(float)
+            sx, sy = Sx[jj] - Sx[ii], Sy[jj] - Sy[ii]
+            sxx, sxy = Sxx[jj] - Sxx[ii], Sxy[jj] - Sxy[ii]
+            den = m * sxx - sx * sx
+            with np.errstate(invalid="ignore", divide="ignore"):
+                slope = np.where((m >= 4) & (den > 0), (m * sxy - sx * sy) / den, np.inf)
+            low = (slope < yield_ratio * k).astype(int)
+            # first index where `yield_persist` consecutive windows are all low
+            run = np.convolve(low, np.ones(yield_persist, int), "valid")
+            if (run >= yield_persist).any():
+                y = int(ii[int(np.argmax(run >= yield_persist))])
     return SqueezeResult(start, float(p0), k, y, float(f.max()))
