@@ -70,6 +70,13 @@ window, and `--duration N` stops after N seconds.
 - A non-zero `Status` register (overload/heat/voltage trip) is shown in purple/red. A
   tripped servo goes soft, which looks exactly like a slip or a crushed fruit.
 
+## Branches
+
+- `dev`: work in progress. Commit and push here.
+- `main`: finished, working code. Changes only by PR from `dev`. It's protected: no
+  direct pushes, no force-pushes, no deletion. The `only-dev-into-main` check fails
+  any PR into `main` from another branch.
+
 ## Layout
 
 ```
