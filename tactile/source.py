@@ -111,6 +111,9 @@ class ArmSource(_Base):
             s.status = self._r("Status")
         return self._fill_err(s)
 
+    def read_status(self) -> dict[str, int]:
+        return self._r("Status")
+
     def safety_report(self) -> dict[str, dict[str, int]]:
         """Read back the protection registers. A bare FeetechMotorsBus does NOT run
         so_follower.configure(), so lerobot's 50 % gripper caps may not be live."""
@@ -169,12 +172,21 @@ class FakeSource(_Base):
     P = 2.0           # load units per tick of error
     FOLLOW = 5.0      # ticks/s per unit of unbalanced load -> time constant 1/(P*FOLLOW) = 0.1 s
 
-    def __init__(self, pushes: bool = True, rate_hz: float = 60.0, seed: int = 0):
+    def __init__(self, pushes: bool = True, rate_hz: float = 60.0, seed: int = 0, cartesian: bool = False):
         try:
             ranges = config.load_ranges()
         except FileNotFoundError:
             ranges = {j: (900, 3100) for j in self.joints}
         super().__init__(ranges)
+        # cartesian=True: gravity from the MuJoCo model, and pushes are real 3D forces at a
+        # point on a link (tau = J^T F). `true_push` exposes them so the GUI can draw the
+        # truth next to the estimate. This proves the pipeline is CONSISTENT, not that the
+        # real arm's signs match: that needs the push-direction check in USAGE.md.
+        self.cartesian = cartesian
+        self.true_push = None      # (link name, world point, world force N) while a push is on
+        if cartesian:
+            from .model import SO101Model
+            self.model = SO101Model(ranges=ranges)
         self.rng = random.Random(seed)
         self.dt = 1.0 / rate_hz
         self.pos = {j: (lo + hi) / 2 for j, (lo, hi) in ranges.items()}
@@ -198,6 +210,34 @@ class FakeSource(_Base):
         g = {"shoulder_lift": 180, "elbow_flex": 120, "wrist_flex": 40}.get(j, 0)
         return g * math.cos((self.pos[j] - 2048) / 4096 * 2 * math.pi)
 
+    def _new_cartesian_push(self, t: float):
+        """A 1-3 N push at a point on one of the arm links (body-local, so it moves with it)."""
+        import numpy as np
+        m = self.model
+        m.set_pose(self.pos)
+        k = self.rng.choice([1, 2, 3, 4])
+        pts = [p for p, s in m.candidates(k) if s == 0.5] or [sum(m.link_segment(k)) / 2]
+        p = pts[self.rng.randrange(len(pts))]
+        body = m.body_of_joint[k]
+        local = m.d.xmat[body].reshape(3, 3).T @ (p - m.d.xpos[body])
+        f = np.array([self.rng.gauss(0, 1) for _ in range(3)])
+        f *= self.rng.uniform(1.0, 3.0) / np.linalg.norm(f)
+        return ((body, local, f), None, t + self.rng.uniform(0.6, 1.2))
+
+    def _cartesian_ext(self) -> dict[str, float]:
+        """'ext' per joint in this sim's convention (load units; ext > 0 pushes toward -ticks)."""
+        m = self.model
+        hold = m.holding_load(self.pos)             # also sets the model pose
+        ext = dict(hold)                            # gravity: steady drive = holding drive
+        if self._push:
+            body, local, f = self._push[0]
+            p = m.d.xpos[body] + m.d.xmat[body].reshape(3, 3) @ local
+            tau = m.torque_from_force(body, p, f)
+            for k, j in enumerate(self.joints):
+                ext[j] -= m.model_to_tick(j, tau[m.dof[k]]) / config.NM_PER_LOAD
+            self.true_push = (m.m.body(body).name, p.copy(), f.copy())
+        return ext
+
     def _object(self) -> float:
         """Force the object pushes back on the gripper (positive = opposes closing)."""
         closing_sign = -1 if self._closed_end == "min" else 1
@@ -220,17 +260,26 @@ class FakeSource(_Base):
         t = self._last - self.t0
 
         if self.pushes and self._push is None and t > self._next_push:
-            j = self.rng.choice(["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex"])
-            self._push = (j, self.rng.choice([-1, 1]) * self.rng.uniform(120, 260), t + self.rng.uniform(0.4, 1.0))
+            if self.cartesian:
+                self._push = self._new_cartesian_push(t)
+            else:
+                j = self.rng.choice(["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex"])
+                self._push = (j, self.rng.choice([-1, 1]) * self.rng.uniform(120, 260),
+                              t + self.rng.uniform(0.4, 1.0))
         if self._push and t > self._push[2]:
             self._push = None
+            self.true_push = None
             self._next_push = t + self.rng.uniform(2.5, 5.0)
 
+        ext_all = self._cartesian_ext() if self.cartesian else None
         s = Sample(t=t)
         for j in self.joints:
-            ext = self._gravity(j)
-            if self._push and self._push[0] == j:
-                ext += self._push[1]
+            if ext_all is not None:
+                ext = ext_all[j]
+            else:
+                ext = self._gravity(j)
+                if self._push and self._push[0] == j:
+                    ext += self._push[1]
             if j == "gripper":
                 ext += self._object()
             if j in self.torque_on and self.goals[j] is not None:
@@ -250,6 +299,9 @@ class FakeSource(_Base):
             s.vel[j] = int(round(v))
             s.status[j] = 0
         return self._fill_err(s)
+
+    def read_status(self):
+        return {j: 0 for j in self.joints}
 
     def safety_report(self):
         return {"Torque_Limit": dict(self.torque_limit), "note": "fake source"}
@@ -277,9 +329,10 @@ class FakeSource(_Base):
         pass
 
 
-def open_source(fake: bool, port: str = config.FOLLOWER_PORT, full: bool = True, pushes: bool = True):
+def open_source(fake: bool, port: str = config.FOLLOWER_PORT, full: bool = True, pushes: bool = True,
+                cartesian: bool = False):
     if fake:
-        return FakeSource(pushes=pushes)
+        return FakeSource(pushes=pushes, cartesian=cartesian)
     import os
     if not os.path.exists(port):
         raise SystemExit(f"Follower not found at {port}\nPlug it in (12 V PSU on), or run with --fake.")
