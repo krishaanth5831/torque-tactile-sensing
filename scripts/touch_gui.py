@@ -14,6 +14,8 @@ Modes:
     python scripts/touch_gui.py --fake                    # simulated arm + simulated finger pushes
     python scripts/touch_gui.py                           # real follower holds its pose: push it
     python scripts/touch_gui.py --soft 4                  # same, softer servos: finer touch
+    python scripts/touch_gui.py --teleop --soft 4 --poke  # pose it with the leader, hold the leader
+                                                          # still: it softens, then poke the follower
     python scripts/touch_gui.py --poke                    # accuracy test: double-click a spot on
                                                           # the model, poke it on the real arm
     python scripts/touch_gui.py --teleop                  # leader drives follower, push the follower
@@ -43,6 +45,7 @@ from tactile.dynmodel import LoadModel
 from tactile.estimator import TouchEstimator
 from tactile.logger import DATA_DIR, CsvLogger
 from tactile.model import SO101Model
+from tactile.source import soft_problems
 from tactile.teleop import FakeLeader, LeaderArm, Teleop
 
 p = base_parser(__doc__)
@@ -52,8 +55,9 @@ p.add_argument("--model", default=None, help="LoadModel json from fit_model.py (
 p.add_argument("--record", action="store_true", help="label the log as no-touch motion for fit_model.py")
 p.add_argument("--torque-limit", type=int, default=500, help="follower Torque_Limit, 0..1000")
 p.add_argument("--soft", type=int, default=None, metavar="P",
-               help="hold mode: lower the servos' P gain to P (lerobot uses 16) while this runs. "
-                    "Softer = more deflection per newton = finer touch. Restored on exit")
+               help="lower the servos' P gain to P (lerobot uses 16) while this runs. Softer = more "
+                    "deflection per newton = finer touch. Hold mode: at start (arm must be off its end "
+                    "stops). Teleop: as soon as the follower is still and off its stops. Restored on exit")
 p.add_argument("--max-step", type=float, default=40, help="teleop: max goal change per tick, ticks")
 p.add_argument("--d-on", type=float, default=6.0, help="touch starts when the noise-weighted torque exceeds this")
 p.add_argument("--d-off", type=float, default=3.5, help="... and ends below this")
@@ -65,8 +69,8 @@ p.add_argument("--limp", action="store_true",
 args = p.parse_args()
 if args.limp and args.teleop:
     p.error("--limp and --teleop don't mix (teleop has to drive the follower)")
-if args.soft is not None and (args.teleop or args.limp):
-    p.error("--soft is for hold mode (in teleop a soft arm sags off the leader's pose)")
+if args.soft is not None and args.limp:
+    p.error("--soft and --limp don't mix (limp never turns torque on)")
 if args.soft is not None and not 1 <= args.soft <= 32:
     p.error("--soft P: 1..32 (lerobot 16, firmware default 32)")
 
@@ -78,7 +82,20 @@ if lm:
 t_build = time.time()
 loc = ContactLocalizer(SO101Model(ranges=src.ranges))
 print(f"[tactile] touch surface: {loc.s.n} points on {', '.join(loc.links)} ({time.time() - t_build:.1f} s)")
-est = TouchEstimator(SO101Model(ranges=src.ranges), lm, p_gain=args.soft or config.P_DEFAULT,
+if args.soft is not None and not args.teleop:
+    # Hold mode keeps the pose it starts in, so check it BEFORE opening anything.
+    s0 = src.read()
+    bad = soft_problems(s0.pos, {}, src.ranges, J)
+    if bad:
+        src.close()
+        print("\n[tactile] --soft refused, nothing was changed:\n    " + "\n    ".join(bad) +
+              "\n  A joint on its end stop can't feel a push, and softening it is unsafe. Either put the"
+              "\n  arm in free space first, or let the leader pose it:\n"
+              f"      python scripts/touch_gui.py --teleop --soft {args.soft}" + (" --poke" if args.poke else ""),
+              file=sys.stderr)
+        sys.exit(2)
+soft_now = args.soft if (args.soft is not None and not args.teleop) else None   # teleop: later
+est = TouchEstimator(SO101Model(ranges=src.ranges), lm, p_gain=soft_now or config.P_DEFAULT,
                      d_on=args.d_on, d_off=args.d_off, localizer=loc)
 leader = None
 if args.teleop:
@@ -89,7 +106,9 @@ log = CsvLogger(name, J, extra=["state", "touch", "d", "contact_link", "cx", "cy
                 + [f"z_{j}" for j in J], fake=args.fake)
 
 lock = threading.Lock()
-shared = {"pos": None, "out": None, "truth": None, "hz": 0.0, "status": {}, "contact": None}
+shared = {"pos": None, "out": None, "truth": None, "hz": 0.0, "status": {}, "contact": None,
+          "soft": (f"soft P={args.soft}" if soft_now else
+                   f"soft P={args.soft} pending: hold the leader still" if args.soft else "")}
 stop = threading.Event()
 relearn = threading.Event()
 
@@ -108,9 +127,10 @@ def worker():
 def _worker():
     if not args.limp:
         src.hold_here(J, args.torque_limit)
-        if args.soft is not None:
+        if soft_now is not None:
             print(f"[tactile] softening servos: P_Coefficient -> {args.soft} (restored on exit)")
             src.set_p_gain(J, args.soft)
+    soft_pending = args.soft is not None and soft_now is None
     rate = RateMeter()
     n = 0
     status = {}
@@ -125,6 +145,20 @@ def _worker():
             est.relearn()
             relearn.clear()
         o = est.update(s.t, dict(src.goals), s.pos, s.load)
+        if soft_pending and o.state == "WATCHING":
+            # teleop: soften once the follower holds a pose clear of its stops. The leader keeps
+            # setting the goals, so no re-aim; a soft follower sags a little below the leader.
+            bad = soft_problems(s.pos, src.goals, src.ranges, J)
+            if bad:
+                with lock:
+                    shared["soft"] = f"soft P={args.soft} WAITING: " + bad[0].split(" (")[0]
+            else:
+                print(f"[tactile] follower still and clear of its stops: P_Coefficient -> {args.soft}")
+                src.set_p_gain(J, args.soft, reaim=False)
+                est.set_p_gain(args.soft)
+                soft_pending = False
+                with lock:
+                    shared["soft"] = f"soft P={args.soft}"
         with lock:
             c = shared["contact"] if o.touching else None
             shared.update(pos=dict(s.pos), out=o, hz=rate.tick(), status=status,
@@ -253,7 +287,7 @@ def draw(viewer, pos, o, c, truth, hz, status):
         add_sphere(scn, target_world(poke["target"]), 0.007, GREEN)
 
     mode = ("FAKE " if args.fake else "") + ("TELEOP" if args.teleop else "LIMP (mirror check)" if args.limp
-                                               else "HOLD") + (f"  soft P={args.soft}" if args.soft else "")
+                                               else "HOLD") + (f"  {shared['soft']}" if shared["soft"] else "")
     if args.record:
         mode += "  RECORDING no-touch motion"
     if args.poke:

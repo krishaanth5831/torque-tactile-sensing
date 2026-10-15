@@ -19,6 +19,7 @@ python scripts/touch_gui.py --fake               # no arm needed: simulated fing
 python scripts/touch_gui.py                      # real follower holds still: touch it
 python scripts/touch_gui.py --soft 4             # softer servos: finer touch
 python scripts/touch_gui.py --poke               # measure the real accuracy, in cm
+python scripts/touch_gui.py --teleop --soft 4 --poke   # pose with the leader, then poke: best signal
 python scripts/touch_gui.py --teleop             # leader drives it (replaces lerobot-teleoperate)
 ```
 
@@ -154,5 +155,7 @@ ROS install's pytest plugins out.
   - the 2026-10-15 real recordings replayed through the new estimator: time spent in
     TOUCH dropped from 81 % to 32 % (hold session with real pushes) and 41 % to 14 %
     (teleop session)
-- Not yet on the real arm: the surface localiser, `--soft`, the poke test (USAGE.md §2C).
+- First real poke test (2026-10-15, P=16, elbow resting on its end stop): median 12 cm,
+  link right 27 %. Light pokes moved each joint only 1–3 ticks: too little signal at P=16.
+  Next: the poke test with `--teleop --soft 4` in a free pose. `--soft` is untested on the arm.
   The gear friction (`FRICTION_NM`) is an estimate until then.

@@ -44,9 +44,12 @@ env -u PYTHONPATH python -m pytest -q tests
 Plug in the follower (white arm, 12 V PSU on). The leader is not needed. Close
 `lerobot-teleoperate` first: only one program can open the follower's port.
 
-**Hold the arm up in free space before starting.** If a joint rests on its end stop
-(the folded rest pose does this for shoulder_lift and elbow), the stop takes the push
-instead of the motor. The GUI shows an END STOP warning when that happens.
+**The arm must be in free space, not on an end stop.** If a joint rests on its stop (the
+folded rest pose does this for shoulder_lift and the elbow), the stop takes the push
+instead of the motor and that joint feels nothing. The GUI shows an END STOP warning. Hold
+mode keeps whatever pose the arm starts in, so the easiest way to get a good pose is to
+let the leader set it: `--teleop`, move the leader so the follower is in free space (elbow
+not folded, gripper a little open), then hold the leader still and touch the follower.
 
 ```bash
 python scripts/touch_gui.py                    # holds its current pose at Torque_Limit 500
@@ -64,9 +67,13 @@ python scripts/touch_gui.py --soft 4           # softer servos: finer touch, wea
 4. Press **R** in the window to re-learn, e.g. after moving it by hand.
 
 `--soft P` lowers the servos' P gain (lerobot uses 16) while the GUI runs. A push then
-deflects each joint more ticks, so the signal is finer, and weaker pushes are felt. Each
-goal is re-aimed so the arm keeps its pose as P drops, and P is restored (with the same
-re-aim) on exit. With torque on, the servo keeps the new P in RAM only; lerobot also
+deflects each joint more ticks, so the signal is finer, and weaker pushes are felt. **Use
+it**: on the real arm at P=16 light pokes moved each joint only 1–3 ticks, too few to
+locate them. In hold mode it softens at start, re-aiming each goal so the arm keeps its
+pose; it refuses (and says why, before opening the window) if a joint is on its end stop.
+With `--teleop --soft 4` it softens as soon as the follower is still and clear of its
+stops (the banner says `WAITING: <joint> on its end stop` until then); a soft follower
+then sags a little below the leader. P is restored on exit. With torque on, the servo keeps the new P in RAM only; lerobot also
 rewrites P=16 every time it connects. In the simulation `--soft 4` catches more pushes and
 is sharper on the wrist, but less sure on the upper arm (§4).
 
@@ -93,7 +100,8 @@ backwards, its `JOINT_SIGN` is wrong (that would also fail check A).
 **C. Poke test: how accurate is it really?**
 
 ```bash
-python scripts/touch_gui.py --poke              # or --poke --soft 4, to compare
+python scripts/touch_gui.py --teleop --soft 4 --poke   # pose it with the leader, hold the leader still
+python scripts/touch_gui.py --poke                     # hold mode at P=16, arm already in free space
 ```
 
 1. Double-click the 3D model where you will poke. A green dot marks the spot.
@@ -124,7 +132,8 @@ python scripts/touch_gui.py --teleop
 - The follower ramps to the leader pose over 2 s (no snap). Each tick moves at most
   `--max-step 40` ticks, and every goal is clamped to the calibrated range.
 - Both arms use the by-id ports in `tactile/config.py`, never `/dev/ttyACM*`.
-- `--soft` is not allowed here: a soft arm sags off the leader's pose.
+- `--soft 4` softens the follower once it is still and clear of its stops; it then sags a
+  little below the leader.
 
 What you'll see:
 - **When you pause the leader**, the follower is still → LEARNING → WATCHING, with
@@ -239,7 +248,7 @@ The real arm's friction is not measured yet; the poke test (§2C) gives the real
 | arrow points backwards | that joint's `JOINT_SIGN` (mirror check A) |
 | model moves differently from the arm | mirror check (A): `JOINT_SIGN` / `JOINT_OFFSET_TICKS` |
 | `servo did not take P_Coefficient` | `--soft` could not set the gain: run without `--soft` |
-| `--soft refused, nothing changed: ...` | a joint is on / near its end stop or far from its goal. Hold the arm up in free space and restart (softening there would make it drive off once lifted) |
+| `--soft refused, nothing was changed` | a joint is on its end stop. Use `--teleop --soft 4` and pose it with the leader (softening on a stop is unsafe: it would drive off once lifted) |
 | `SERVO STATUS ERROR` banner | overload / heat / voltage protection tripped; the servo goes soft. Lower `--torque-limit`, let it cool |
 | window frozen, terminal still logging | the window isn't being drawn (hidden / other workspace / screen locked). Bring it to front; Ctrl+C works either way |
 | Wayland `GLFWError: window position` warning | cosmetic, the window still opens |

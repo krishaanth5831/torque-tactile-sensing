@@ -193,11 +193,11 @@ class SimArmSource(_Base):
             self.goals[j] = self.clamp(j, v)
         self._sync_goals()
 
-    def set_p_gain(self, joints, p):
+    def set_p_gain(self, joints, p, reaim=True):
         """Softer servo, same pose: re-aim the goal so the holding torque is unchanged."""
         for j in joints:
             k = self.joints.index(j)
-            if self.goals[j] is not None:
+            if reaim and self.goals[j] is not None:
                 e = self.goals[j] - self.sim.pos[k]
                 self.goals[j] = self.clamp(j, round(self.sim.pos[k] + e * self.sim.p_gain[k] / p))
             self.sim.p_gain[k] = p
