@@ -1,4 +1,4 @@
-"""Fit the "expected load while moving" model from a NO-TOUCH recording.
+"""Fit the "expected position error while moving" model from a NO-TOUCH recording.
 
     python scripts/touch_gui.py --teleop --record        # 2-3 min: move the leader everywhere,
                                                          # slow and fast, DON'T touch the follower
@@ -6,7 +6,7 @@
     python scripts/touch_gui.py --teleop --model models/load_model.json
 
 Several CSVs can be given (each is replayed separately so the derivative filter never
-spans two recordings). The window shows measured vs predicted load per joint. The gap
+spans two recordings). The window shows measured vs predicted err (goal - pos, ticks) per joint. The gap
 between them is the noise floor of touch detection while moving: the printed sigma.
 """
 import argparse
@@ -38,7 +38,7 @@ for f in args.csv:
     r = read_log(Path(f))
     print(f"{f}: {len(r)} rows")
     if rows:
-        rows.append({"t": rows[-1]["t"], "goal": {j: None for j in config.JOINTS}, "load": rows[-1]["load"]})
+        rows.append({"t": rows[-1]["t"], "goal": {j: None for j in config.JOINTS}, "y": rows[-1]["y"]})
     rows += r
 lm = LoadModel.fit(rows, model)
 out = Path(args.out)
@@ -48,7 +48,7 @@ if out.exists():
     print(f"previous model kept as {stamp}")
 lm.save(out)
 print(f"\nsaved {out}")
-print(f"{'joint':14s} {'R^2':>6s} {'sigma (load units)':>20s}")
+print(f"{'joint':14s} {'R^2':>6s} {'sigma (ticks)':>20s}")
 for j in config.JOINTS:
     print(f"{j:14s} {lm.r2[j]:6.2f} {lm.sigma[j]:20.1f}")
 print("\nLow R^2 on a joint that barely moved is normal. Large sigma = less sensitive while moving.")
@@ -68,10 +68,10 @@ if not args.no_window:
         pr = lm.predict(features(model, r["goal"], der))
         t.append(r["t"])
         for j in config.JOINTS:
-            meas[j].append(r["load"][j])
+            meas[j].append(r["y"][j])
             pred[j].append(pr[j])
     fig, axes = plt.subplots(len(config.JOINTS), 1, sharex=True, figsize=(11, 12))
-    fig.canvas.manager.set_window_title("fit_model: measured vs predicted load")
+    fig.canvas.manager.set_window_title("fit_model: measured vs predicted err")
     for ax, j in zip(axes, config.JOINTS):
         ax.plot(t, meas[j], lw=0.8, label="measured")
         ax.plot(t, pred[j], lw=0.8, label="predicted")

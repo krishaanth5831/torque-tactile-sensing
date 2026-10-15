@@ -96,6 +96,8 @@ class ArmSource(_Base):
         self.full = full  # False = only pos/load/current, for a faster loop
         self._torque_on: set[str] = set()
         self._orig_torque_limit: dict[str, int] = {}
+        self._orig_p: dict[str, int] = {}
+        self._p: dict[str, int] = {}
 
     def _r(self, reg: str) -> dict[str, int]:
         return self.bus.sync_read(reg, self.joints, normalize=False, num_retry=1)
@@ -141,6 +143,52 @@ class ArmSource(_Base):
         self.bus.sync_write("Goal_Position", goal, normalize=False)
         self.goals.update(goal)
 
+    def _avg_pos(self, n: int = 8) -> dict[str, float]:
+        reads = [self._r("Present_Position") for _ in range(n)]
+        return {j: sum(r[j] for r in reads) / n for j in self.joints}
+
+    def _reaim(self, joints: list[str], p_from: dict[str, float], p_to: dict[str, float]) -> None:
+        """Move each goal so drive = P * (goal - pos) stays the same when P changes: the
+        joint keeps pushing exactly as hard as before, so it does not sag or jump."""
+        pos = self._avg_pos()
+        goal = {}
+        for j in joints:
+            if self.goals[j] is not None:
+                goal[j] = self.clamp(j, round(pos[j] + (self.goals[j] - pos[j]) * p_from[j] / p_to[j]))
+        if goal:
+            self.bus.sync_write("Goal_Position", goal, normalize=False)
+            self.goals.update(goal)
+
+    def set_p_gain(self, joints: list[str], p: int, steps: int = 4) -> None:
+        """Softer servos for sensing (session only). Lowered in `steps` with the goal re-aimed
+        each time. With torque on, lerobot keeps Lock=1, so the write lands in RAM and is
+        lost at power-off; it is read back to confirm, and close() restores it."""
+        cur = self._r("P_Coefficient")
+        for j in joints:
+            self._orig_p.setdefault(j, cur[j])
+        for k in range(1, steps + 1):
+            step = {j: round(cur[j] + (p - cur[j]) * k / steps) for j in joints}
+            before = {j: self._p.get(j, cur[j]) for j in joints}
+            for j in joints:
+                self.bus.write("P_Coefficient", j, step[j], normalize=False)
+            self._p.update(step)
+            self._reaim(joints, before, step)
+            time.sleep(0.15)
+        back = self._r("P_Coefficient")
+        bad = {j: back[j] for j in joints if back[j] != p}
+        if bad:
+            raise RuntimeError(f"servo did not take P_Coefficient={p}: read back {bad}")
+
+    def restore_p_gain(self) -> None:
+        if not self._orig_p:
+            return
+        joints = list(self._orig_p)
+        self._reaim(joints, {j: self._p[j] for j in joints}, {j: self._orig_p[j] for j in joints})
+        for j in joints:
+            self.bus.write("P_Coefficient", j, self._orig_p[j], normalize=False)
+        self._p.update(self._orig_p)
+        self._orig_p.clear()
+
     def release(self, joints: list[str]) -> None:
         self.bus.disable_torque(joints)
         self._torque_on.difference_update(joints)
@@ -148,8 +196,13 @@ class ArmSource(_Base):
             self.goals[j] = None
 
     def close(self, release: bool = False) -> None:
-        """Default: leave torque ON so the arm does not drop. Torque_Limit is restored."""
+        """Default: leave torque ON so the arm does not drop. P gain and Torque_Limit are restored."""
         try:
+            try:
+                self.restore_p_gain()
+            except Exception as e:                    # never skip the rest of the cleanup
+                print(f"[tactile] WARNING: could not restore P_Coefficient ({e}); lerobot resets it to 16 "
+                      "on its next connect")
             for j, v in self._orig_torque_limit.items():
                 self.bus.write("Torque_Limit", j, v, normalize=False)
         finally:
@@ -172,21 +225,12 @@ class FakeSource(_Base):
     P = 2.0           # load units per tick of error
     FOLLOW = 5.0      # ticks/s per unit of unbalanced load -> time constant 1/(P*FOLLOW) = 0.1 s
 
-    def __init__(self, pushes: bool = True, rate_hz: float = 60.0, seed: int = 0, cartesian: bool = False):
+    def __init__(self, pushes: bool = True, rate_hz: float = 60.0, seed: int = 0):
         try:
             ranges = config.load_ranges()
         except FileNotFoundError:
             ranges = {j: (900, 3100) for j in self.joints}
         super().__init__(ranges)
-        # cartesian=True: gravity from the MuJoCo model, and pushes are real 3D forces at a
-        # point on a link (tau = J^T F). `true_push` exposes them so the GUI can draw the
-        # truth next to the estimate. This proves the pipeline is CONSISTENT, not that the
-        # real arm's signs match: that needs the push-direction check in USAGE.md.
-        self.cartesian = cartesian
-        self.true_push = None      # (link name, world point, world force N) while a push is on
-        if cartesian:
-            from .model import SO101Model
-            self.model = SO101Model(ranges=ranges)
         self.rng = random.Random(seed)
         self.dt = 1.0 / rate_hz
         self.pos = {j: (lo + hi) / 2 for j, (lo, hi) in ranges.items()}
@@ -210,34 +254,6 @@ class FakeSource(_Base):
         g = {"shoulder_lift": 180, "elbow_flex": 120, "wrist_flex": 40}.get(j, 0)
         return g * math.cos((self.pos[j] - 2048) / 4096 * 2 * math.pi)
 
-    def _new_cartesian_push(self, t: float):
-        """A 1-3 N push at a point on one of the arm links (body-local, so it moves with it)."""
-        import numpy as np
-        m = self.model
-        m.set_pose(self.pos)
-        k = self.rng.choice([1, 2, 3, 4])
-        pts = [p for p, s in m.candidates(k) if s == 0.5] or [sum(m.link_segment(k)) / 2]
-        p = pts[self.rng.randrange(len(pts))]
-        body = m.body_of_joint[k]
-        local = m.d.xmat[body].reshape(3, 3).T @ (p - m.d.xpos[body])
-        f = np.array([self.rng.gauss(0, 1) for _ in range(3)])
-        f *= self.rng.uniform(1.0, 3.0) / np.linalg.norm(f)
-        return ((body, local, f), None, t + self.rng.uniform(0.6, 1.2))
-
-    def _cartesian_ext(self) -> dict[str, float]:
-        """'ext' per joint in this sim's convention (load units; ext > 0 pushes toward -ticks)."""
-        m = self.model
-        hold = m.holding_load(self.pos)             # also sets the model pose
-        ext = dict(hold)                            # gravity: steady drive = holding drive
-        if self._push:
-            body, local, f = self._push[0]
-            p = m.d.xpos[body] + m.d.xmat[body].reshape(3, 3) @ local
-            tau = m.torque_from_force(body, p, f)
-            for k, j in enumerate(self.joints):
-                ext[j] -= m.model_to_tick(j, tau[m.dof[k]]) / config.NM_PER_LOAD
-            self.true_push = (m.m.body(body).name, p.copy(), f.copy())
-        return ext
-
     def _object(self) -> float:
         """Force the object pushes back on the gripper (positive = opposes closing)."""
         closing_sign = -1 if self._closed_end == "min" else 1
@@ -260,26 +276,18 @@ class FakeSource(_Base):
         t = self._last - self.t0
 
         if self.pushes and self._push is None and t > self._next_push:
-            if self.cartesian:
-                self._push = self._new_cartesian_push(t)
-            else:
-                j = self.rng.choice(["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex"])
-                self._push = (j, self.rng.choice([-1, 1]) * self.rng.uniform(120, 260),
-                              t + self.rng.uniform(0.4, 1.0))
+            j = self.rng.choice(["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex"])
+            self._push = (j, self.rng.choice([-1, 1]) * self.rng.uniform(120, 260),
+                          t + self.rng.uniform(0.4, 1.0))
         if self._push and t > self._push[2]:
             self._push = None
-            self.true_push = None
             self._next_push = t + self.rng.uniform(2.5, 5.0)
 
-        ext_all = self._cartesian_ext() if self.cartesian else None
         s = Sample(t=t)
         for j in self.joints:
-            if ext_all is not None:
-                ext = ext_all[j]
-            else:
-                ext = self._gravity(j)
-                if self._push and self._push[0] == j:
-                    ext += self._push[1]
+            ext = self._gravity(j)
+            if self._push and self._push[0] == j:
+                ext += self._push[1]
             if j == "gripper":
                 ext += self._object()
             if j in self.torque_on and self.goals[j] is not None:
@@ -331,8 +339,13 @@ class FakeSource(_Base):
 
 def open_source(fake: bool, port: str = config.FOLLOWER_PORT, full: bool = True, pushes: bool = True,
                 cartesian: bool = False):
+    """cartesian=True (touch GUI): the MuJoCo-based ServoArmSim with 3D finger pushes on the
+    real surface. Otherwise the simple per-joint FakeSource of the 2D scripts."""
+    if fake and cartesian:
+        from .sim import SimArmSource
+        return SimArmSource(pushes=pushes)
     if fake:
-        return FakeSource(pushes=pushes, cartesian=cartesian)
+        return FakeSource(pushes=pushes)
     import os
     if not os.path.exists(port):
         raise SystemExit(f"Follower not found at {port}\nPlug it in (12 V PSU on), or run with --fake.")

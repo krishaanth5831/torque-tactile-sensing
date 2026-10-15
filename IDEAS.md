@@ -18,6 +18,13 @@ drives the motor through a big gearbox. Readable registers that carry force info
 | `vel` | Present_Velocity (58) | joint speed | needed to separate friction from touch |
 | `status` | Status (65) | error bits | an overload trip makes the servo go soft and **looks like a slip**. Always watch it |
 
+**Measured on the real follower (2026-10-15):** `err` wins. Present_Load is ≈ −9 × err
+(P=16) with a dead band: it reads 0, then jumps straight to ±20, so it carries strictly
+less than err. Present_Current never exceeded 1–7 raw units at rest and under light
+pushes: useless for touch. err jitters ±0.5 tick at rest, so averaging it over 0.1 s
+resolves fractions of a tick. The touch GUI now runs on err alone
+(`tactile/config.py`: `NM_PER_TICK_P16`).
+
 Three physical facts decide what is possible:
 
 1. **Gear friction is the enemy.** About 1:345 reduction means lots of static friction. A
@@ -69,12 +76,27 @@ differ only in how they predict "expected".
 - **next** admittance: `goal += K × residual` each tick, a smooth version of comply.
 - **later** kinesthetic teaching: record demonstrations by pushing the follower directly,
   with no leader arm. That's a cheaper way to collect LeRobot data.
-- **built** where is the force? `touch_gui.py`. The most distal loaded joint picks the
-  link, then a least-squares fit of τ = Jᵀ F over points on it gives the point and
-  direction. It's honest about the 1–3-joint links, where only the link is certain.
+- **built** where is the force? `tactile/contact.py`, shown by `touch_gui.py`. ~4600
+  points on the real link surfaces (from the meshes, unreachable faces dropped); at each,
+  the best **push-only** fingertip force (friction cone around the inward normal, FISTA,
+  all points at once) and how well τ = Jᵀ F explains all six joints, including the
+  zero-reading ones. Probability per point = heat cloud; evidence adds up while a touch
+  lasts. Same idea as the Contact Particle Filter (Manuelli & Tedrake, 2016). On the
+  realistic sim (`bench_touch.py`): gripper ~1 cm, wrist 2–3 cm, forearm / upper arm
+  ~4 cm. The 1–3-joint links stay ambiguous by physics, and the cloud shows it.
+- **built** `--poke`: double-click a spot on the model, poke it on the arm, cm error per
+  poke. The real accuracy number.
+- **next** beat friction with **dither**: a small fast goal oscillation (±2–4 ticks at
+  ~20 Hz) keeps every joint moving, so static friction averages out of the 0.1 s window
+  instead of hiding light pushes and leaving offsets after release. Costs a faint hum.
+  Try it in `sim.py` first (it already models friction).
+- **next** fit per-joint torque gains (and `FRICTION_NM`) from poke-test data: the points
+  are known, so the gains that minimise the poke error can be solved for.
+- **next** active touch for the proximal links: when a touch is ambiguous, wiggle the
+  wrist/elbow a few ticks while the finger stays. New poses give new Jacobians, which
+  pin the point down on the upper arm too.
 - **next** a calibrated force scale (kitchen scale), so the ~N become real N.
-- **later** a tactile "map" on the model: accumulate where it gets touched over a
-  session (a heat map on the links).
+- **later** a tactile "map" over a whole session: accumulate where it gets touched.
 
 ---
 
@@ -157,7 +179,11 @@ contact into a force reading, so it acts as a spring scale.
 
 ## 6. Known limits (be honest about them)
 
-- Not a torque sensor: gear friction, a hysteresis dead band, quantisation.
+- Not a torque sensor: gear friction, a hysteresis dead band, quantisation. After a push
+  a joint can settle up to (dead zone + friction / K) ticks off; the estimator ignores
+  offsets inside that rest band, which also means pushes smaller than it are not felt.
+- Joint torques alone can't locate a touch on links that move only 1–2 joints (shoulder,
+  upper arm), nor any push parallel to the pitch axes. See USAGE.md §4.
 - Drifts with motor temperature and supply voltage (the 12 V PSU sags under load).
 - The register semantics are Feetech-firmware specific, and the current unit (≈6.5 mA) is
   from their docs, not verified here.
@@ -170,7 +196,9 @@ contact into a force reading, so it acts as a spring scale.
 ## 7. Code TODO
 
 - [ ] block read of 56–70 (speed)
-- [ ] `fit_model.py`: L2 gravity + friction regression from free-motion CSVs
+- [x] `fit_model.py`: L2 gravity + friction regression from free-motion CSVs (now on err)
+- [x] surface contact localisation + poke test + realistic sim benchmark
+- [ ] dither mode (§2), per-joint gains from poke data, active touch
 - [ ] `calibrate_grams.py` + a `calibration.json` mapping units to grams
 - [ ] lift/slip/weight-check script (§3E)
 - [ ] lerobot robot subclass exposing load/current as observations (§4)
