@@ -13,21 +13,30 @@ needed) and `--duration N` (stop after N seconds). Every run writes a **new**
 
 ---
 
-## 1. Test it by itself (no arm needed)
+## 1. Without the arm: simulation and your own recordings
 
-Start here. The simulated arm behaves like the real one: integer encoder ticks with
-jitter, a P servo whose stiffness follows its gain, gear friction, the Present_Load dead
-band. A simulated fingertip presses random points of the real surface (1–5 N).
+**The simulated arm is calibrated to the real follower** (2026-10-15 recordings): integer
+encoder ticks that sit still for seconds (only ~5 % of readings flicker), a P servo whose
+stiffness follows its gain, ~0.05 N·m of static gear friction per joint (after a poke a
+real joint stays parked up to 2–3 ticks off), the servo's 1-tick dead zone, the
+Present_Load dead band. A simulated fingertip presses random points of the real surface
+(1–5 N).
 
 ```bash
 # The touch GUI: heat cloud on the surface where the touch can be, red ball + arrow at
 # the most likely point, cyan = the TRUE simulated push, and the error in cm on top
 python scripts/touch_gui.py --fake
-python scripts/touch_gui.py --fake --soft 4        # softer servos (see §2)
+python scripts/touch_gui.py --fake --dither 4      # with dither (see §2)
 python scripts/touch_gui.py --fake --teleop        # simulated leader moving it around
 
-# Accuracy in numbers: random poses x random pushes, cm error per link (no window, ~6 min)
-systemd-run --user --scope -p MemoryMax=3G python scripts/bench_touch.py
+# Any recorded run, played back through the CURRENT code (green dot = poke target, if logged)
+python scripts/touch_gui.py --replay data/poke_<stamp>.csv --replay-speed 2
+
+# Numbers on recorded runs: time in TOUCH, touches, and for poke runs the cm error per poke
+python scripts/replay_eval.py data/poke_<stamp>.csv              # add --variants to compare settings
+
+# Accuracy on the simulated arm, per link (no window; 2 earlier pokes leave friction offsets)
+systemd-run --user --scope -p MemoryMax=3G python scripts/bench_touch.py --p 16 --dither 0 4 --window 0.25
 
 # Plain signal plots and the simpler detectors from step 0/1
 python scripts/live_view.py --fake
@@ -42,15 +51,21 @@ env -u PYTHONPATH python -m pytest -q tests
 ## 2. The real arm on its own (follower holds still, you push it)
 
 Plug in the follower (white arm, 12 V PSU on). The leader is not needed. Close
-`lerobot-teleoperate` first: only one program can open the follower's port.
+`lerobot-teleoperate` / `~/teleop.sh` first: only one program can use the follower's bus.
 
-**Hold the arm up in free space before starting.** If a joint rests on its end stop
-(the folded rest pose does this for shoulder_lift and elbow), the stop takes the push
-instead of the motor. The GUI shows an END STOP warning when that happens.
+**The arm must be in free space, not on an end stop.** If a joint rests on its stop (the
+folded rest pose does this for shoulder_lift, the elbow and the closed gripper), the stop
+takes pushes in that direction and the joint can only report pushes that lift it off. The
+GUI shows an END STOP warning. Hold mode keeps whatever pose the arm starts in, so the
+easiest way to get a good pose is to let the leader set it: `--teleop`, move the leader so
+the follower is in free space (elbow not folded, gripper a little open), then hold the
+leader still and touch the follower.
 
 ```bash
-python scripts/touch_gui.py                    # holds its current pose at Torque_Limit 500
-python scripts/touch_gui.py --soft 4           # softer servos: finer touch, weaker hold
+python scripts/touch_gui.py --dither 4         # recommended: holds its pose, goals shake +-4 ticks
+python scripts/touch_gui.py                    # no dither (P=16)
+python scripts/touch_gui.py --soft 4           # softer servos (arm must already be off its stops)
+python scripts/touch_gui.py --teleop --dither 4 --soft 4    # pose it with the leader first
 ```
 
 1. It starts in **LEARNING** (about 2 s). **Don't touch it** while it learns what
@@ -63,17 +78,25 @@ python scripts/touch_gui.py --soft 4           # softer servos: finer touch, wea
    direction wobbles a little.
 4. Press **R** in the window to re-learn, e.g. after moving it by hand.
 
-`--soft P` lowers the servos' P gain (lerobot uses 16) while the GUI runs. A push then
-deflects each joint more ticks, so the signal is finer, and weaker pushes are felt. Each
-goal is re-aimed so the arm keeps its pose as P drops, and P is restored (with the same
-re-aim) on exit. With torque on, the servo keeps the new P in RAM only; lerobot also
-rewrites P=16 every time it connects. In the simulation `--soft 4` catches more pushes and
-is sharper on the wrist, but less sure on the upper arm (§4).
+**`--dither A`** (try 4): each goal shakes ±A ticks at `--dither-hz` (8). The real arm's
+gear friction (~0.05 N·m) otherwise holds light pokes without the joint moving and parks
+joints off after every poke; kept moving, the friction averages out. On the calibrated
+simulation it removes every stuck touch, ends a touch 0.18 s after release (0.7 s without)
+and catches more pushes (§4). Sensing uses the unshaken goal, joints resting on a stop are not shaken, and the
+arm hums faintly (±4 ticks ≈ ±0.35°). **Not tried on the real arm yet.**
+
+**`--soft P`** lowers the servos' P gain (lerobot uses 16) while the GUI runs, so a push
+deflects each joint more ticks. In hold mode it softens at start, re-aiming each goal so
+the arm keeps its pose; it refuses (before opening the window) if a joint is on its end
+stop. With `--teleop --soft 4` it softens as soon as the follower is still and clear of its
+stops (the banner says `WAITING: <joint> on its end stop` until then); a soft follower then
+sags a little below the leader. P is restored on exit; with torque on the servo keeps the
+new P in RAM only, and lerobot rewrites P=16 every time it connects. Note: the friction is
+the same in N·m at any P, so `--soft` alone helps less than `--dither`.
 
 ### First-time checks (once)
 
-**A. Mirror check** (done 2026-10-15; wrist_roll needed +1024 ticks). Re-do it after any
-recalibration:
+**A. Mirror check.** Re-do it after any recalibration:
 
 ```bash
 python scripts/touch_gui.py --limp     # never enables torque: move it by hand. SUPPORT the arm
@@ -85,28 +108,31 @@ Move one joint at a time by hand and watch the model.
   (4096 ticks = 360°, so 11 ticks ≈ 1°).
 - Gripper jaw opens when the real one closes: `GRIPPER_MODEL_FLIP = True`.
 
-**B. Push-direction check.** The force direction now comes from physics (a push toward
-+ticks lowers `err`), not from a sign setting, so this check should pass as is. Hold mode,
-wait for WATCHING, rotate the view to match where you stand, push the gripper sideways:
-the red arrow must point the way your finger pushes. If a single joint's arrow is
-backwards, its `JOINT_SIGN` is wrong (that would also fail check A).
+**B. Push-direction check.** The force direction comes from physics (a push toward +ticks
+lowers `err`), not from a sign setting. Hold mode, wait for WATCHING, rotate the view to
+match where you stand, push the gripper sideways: the red arrow must point the way your
+finger pushes. If a single joint's arrow is backwards, its `JOINT_SIGN` is wrong (that
+would also fail check A).
 
 **C. Poke test: how accurate is it really?**
 
 ```bash
-python scripts/touch_gui.py --poke              # or --poke --soft 4, to compare
+python scripts/touch_gui.py --teleop --dither 4 --poke     # pose it with the leader, hold the leader still
+python scripts/touch_gui.py --poke                         # hold mode, arm already in free space
 ```
 
 1. Double-click the 3D model where you will poke. A green dot marks the spot.
-2. Poke that spot on the real arm, ~1 s each, 5–10 times. The terminal prints each poke's
-   error in cm and the median for that spot.
+2. Poke that spot on the real arm firmly, ~1 s each, 5–10 times. The terminal prints each
+   poke's error in cm and the median for that spot.
 3. Double-click a new spot, repeat. Cover every link: gripper, jaw, wrist, forearm, upper
    arm, shoulder.
 4. Ctrl+C. It prints the overall median error and link accuracy and saves
    `data/poke_results_<stamp>.json`.
 
-Send the summary back: it is the only honest accuracy number for the real arm, and it
-tells whether `FRICTION_NM` / `TAU_FLOOR_NM` in `tactile/config.py` need tuning.
+Every row of the poke CSV logs the current target, so `replay_eval.py` can score the run
+again after any code change, without the arm. (The 2026-10-15 poke run predates this: its
+targets had to be paired with touches by order, and the old estimator's stuck "touches"
+got some of them, so its numbers are unreliable.)
 
 ---
 
@@ -125,7 +151,8 @@ python scripts/touch_gui.py --teleop
 - The follower ramps to the leader pose over 2 s (no snap). Each tick moves at most
   `--max-step 40` ticks, and every goal is clamped to the calibrated range.
 - Both arms use the by-id ports in `tactile/config.py`, never `/dev/ttyACM*`.
-- `--soft` is not allowed here: a soft arm sags off the leader's pose.
+- `--soft 4` softens the follower once it is still and clear of its stops; it then sags a
+  little below the leader. `--dither` works here too.
 
 What you'll see:
 - **When you pause the leader**, the follower is still → LEARNING → WATCHING, with
@@ -162,24 +189,41 @@ refused: re-record.
 
 **The signal.** Each servo's position error `err = goal - pos`. The servo is a P
 controller, so at rest external torque = −K × (err − err at rest), K ≈ 0.026 N·m per tick
-at P=16 (4× less at P=4). Present_Load turned out to be ≈ −9 × err with a dead band
-(it reads 0, then jumps to ±20), so it carries less; Present_Current tops out at 1–7 raw
-units, useless. err is averaged over 0.1 s, which resolves fractions of a tick.
+at P=16 (4× less at P=4). Present_Load is ≈ −9 × err with a dead band (0, then ±20), so it
+carries less; Present_Current tops out at 1–7 raw units, useless. err is averaged over
+0.1 s (two dither periods with `--dither`). On the real arm the readings sit on one integer
+for seconds, so averaging buys little without dither.
+
+**What limits it: gear friction.** About 0.05 N·m per joint on the real follower (from the
+recordings). A poke smaller than that doesn't move the joint at all, and after any poke
+the joint stays parked up to `friction / K` ticks off (about 2 ticks at P=16). Light real
+pokes moved joints only 1–4 ticks, so friction is the same size as the signal. Dither is
+the fix (it keeps every joint moving, so the friction averages out); a softer P gain alone
+doesn't change the friction in N·m.
 
 **Detection.** One number over all joints, `d = sqrt(sum (torque_j / noise_j)^2)`, on/off
-at `--d-on 6` / `--d-off 3.5`. Only the part of each joint's error beyond its **rest
-band** counts: after a push a servo can settle anywhere inside its 1-tick dead zone plus
-what gear friction holds (`DEAD_ZONE_TICKS`, `FRICTION_NM` in `tactile/config.py`).
-Without that band a released push looked like a touch that never ended. A "touch" that
-stays perfectly steady for 5 s is re-learned as the new baseline (a finger is never that
-steady).
+at `--d-on 6` / `--d-off 3.5`, where each joint only counts beyond its **rest band**
+`max(1-tick dead zone, FRICTION_NM / K)`. Three rules stop friction from faking touches
+(the GUI said TOUCH 36–81 % of the time on the real recordings; now 3–28 %):
+- while nothing touches, the baseline follows wherever friction parks each joint, so a
+  touch is measured from just before it (an earlier poke's leftover offset on another joint
+  no longer looks like part of this one);
+- a touch is over once every joint has been dead still for 0.6 s within two rest bands
+  (a finger is never that still) and the parked pose becomes the baseline;
+- the spring-back when a finger lifts after such a re-zero (about minus the touch) is
+  recognised and not reported as a new touch.
+With `--dither` the last two are off: there is no parking to undo.
 
 **Where.** `tactile/contact.py` scores ~4600 points covering the real surface of every
 moving link (5 mm apart, from the meshes; points inside the arm or facing a neighbouring
 part are dropped). For each point it fits the force a fingertip could apply there, which
 can only **push into the surface** (a friction cone around the inward normal), and asks how
 well `torque = J(point)^T force` explains all six joints, including the ones reading ~0.
-That gives a probability per point: the heat cloud. Evidence adds up while one touch lasts.
+Points that would need an implausible finger force (0.2 N or 40 N; log-normal around 3 N)
+count less: the old "smallest force wins" rule put shoulder pokes on the gripper. A joint
+resting on an end stop gives one-sided evidence: it can't feel a push into its stop, but a
+push that would have lifted it off would have shown. That gives a probability per point:
+the heat cloud. Evidence adds up while one touch lasts.
 
 **The physics ceiling** (no algorithm can beat it with joint torques alone):
 
@@ -194,19 +238,20 @@ Pushes **parallel to the pitch axes** (shoulder_lift, elbow, wrist_flex are para
 those joints nothing, wherever they land, so they all look like shoulder pushes. The heat
 cloud and the `+-cm` show the uncertainty honestly instead of hiding it.
 
-**Measured on the simulated arm** (`bench_touch.py`, 40 random 1–5 N pushes per setting,
-gear friction 0.005–0.02 N·m; median error of the most likely point):
+**Measured on the calibrated simulation** (`bench_touch.py`, 30 random 1–5 N pushes per
+setting at random poses, friction 0.05 N·m, two earlier pokes leave the joints parked;
+median error of the most likely point):
 
-| | P=16 (default) | P=4 (`--soft 4`) |
-|---|---|---|
-| pushes detected | 78–80 % | 88 % |
-| false touches / stuck touches | 0 / 0 | 0 / 0 (19/40 stuck at 0.02 N·m friction) |
-| gripper + jaw | ~1 cm | 1–2 cm |
-| wrist | 2.5–3 cm | 1–2 cm |
-| forearm | ~4 cm | ~4 cm |
-| upper arm | ~4 cm, link right 83 % | ~5 cm, link right 38–50 % |
+| | P=16 | P=16 + `--dither 4` | P=4 + `--dither 8` |
+|---|---|---|---|
+| pushes detected | 73 % | 83 % | 83 % |
+| touches stuck after release | 1 / 30 | 0 / 30 | 0 / 30 |
+| touch ends after release (median) | 0.70 s | 0.18 s | 0.22 s |
+| right link | 73 % | 76 % | 76 % |
+| median error / 80 % within | 3.9 / 6.6 cm | 3.5 / 7.3 cm | 3.3 / 6.9 cm |
 
-The real arm's friction is not measured yet; the poke test (§2C) gives the real numbers.
+Before the friction fixes (same simulation): 20/40 stuck touches, 55 % right link, 5.6 cm.
+The real arm's accuracy needs a clean poke test (§2C).
 
 ---
 
@@ -215,10 +260,14 @@ The real arm's friction is not measured yet; the poke test (§2C) gives the real
 | command | what |
 |---|---|
 | `touch_gui.py [--fake] [--teleop] [--model F] [--record]` | the 3D touch GUI (hold or teleop) |
-| `touch_gui.py --soft P` | hold mode with softer servos (P gain, lerobot 16), restored on exit |
+| `touch_gui.py --dither A [--dither-hz F]` | shake goals ±A ticks so friction averages out (try 4) |
+| `touch_gui.py --soft P` | softer servos (P gain, lerobot 16), restored on exit |
 | `touch_gui.py --poke` | accuracy test: double-click a spot, poke it, cm error per poke |
+| `touch_gui.py --replay CSV [--replay-speed S]` | a recorded run through the current code, in 3D |
 | `touch_gui.py --torque-limit N --max-step N --d-on D --d-off D` | tuning: hold strength, teleop speed cap, detection thresholds |
-| `bench_touch.py [--p 16 4] [--friction ...] [--trials N]` | accuracy on the simulated arm, per link |
+| `replay_eval.py CSV [--variants]` | numbers on a recorded run: TOUCH time, touches, poke cm error |
+| `bench_touch.py [--p ...] [--friction ...] [--dither ...] [--trials N]` | accuracy on the simulated arm, per link |
+| `self_calibrate.py --fake` | measures each joint's jitter + friction band by tiny moves (sim; the real-arm run stays within ±1.5 % of each range, not run yet) |
 | `fit_model.py CSV... [--out F]` | fit expected err while moving from no-touch recordings |
 | `live_view.py [--hold arm]` | raw load / current / position error plots |
 | `push_detect.py [--mode hold\|wiggle] [--react none\|stop\|comply] [--signal load\|cur\|err]` | 2D detector, collision stop, lead-through |
@@ -235,14 +284,16 @@ The real arm's friction is not measured yet; the poke test (§2C) gives the real
 | `Could not connect` / port busy | `lerobot-teleoperate` or another script still has the port |
 | `END STOP` warning | a joint rests on its mechanical stop: lift the arm into free space, press R |
 | constant TOUCH right after LEARNING | you touched it while learning, or it was still settling: press **R** |
-| touch never ends after a push | friction bigger than `FRICTION_NM`: raise it in `tactile/config.py` (or wait 5 s) |
+| touch never ends after a push | friction bigger than `FRICTION_NM`: raise it in `tactile/config.py`, or use `--dither` |
+| a long steady press ends by itself | without dither, a press held dead still looks like friction parking: use `--dither` |
+| light pokes not felt | below the gear friction: poke firmer, or use `--dither` |
 | touches while moving, nobody touching | no / old model. Record more varied motion and re-fit |
 | arrow points backwards | that joint's `JOINT_SIGN` (mirror check A) |
 | model moves differently from the arm | mirror check (A): `JOINT_SIGN` / `JOINT_OFFSET_TICKS` |
 | `servo did not take P_Coefficient` | `--soft` could not set the gain: run without `--soft` |
-| `--soft refused, nothing changed: ...` | a joint is on / near its end stop or far from its goal. Hold the arm up in free space and restart (softening there would make it drive off once lifted) |
+| `--soft refused, nothing was changed` | a joint is on its end stop. Use `--teleop --soft 4` and pose it with the leader (softening on a stop is unsafe: it would drive off once lifted) |
 | `SERVO STATUS ERROR` banner | overload / heat / voltage protection tripped; the servo goes soft. Lower `--torque-limit`, let it cool |
 | window frozen, terminal still logging | the window isn't being drawn (hidden / other workspace / screen locked). Bring it to front; Ctrl+C works either way |
 | Wayland `GLFWError: window position` warning | cosmetic, the window still opens |
-| `Failed to sync read ... no status packet` at start | the bus didn't answer the first read: run it again |
-| low Hz in the banner | each register read is a bus round trip; touch_gui reads 3 per tick + Status every 10th |
+| `Failed to sync read ... no status packet` / `Incorrect status packet` | another program is using the arm (`~/teleop.sh` / `lerobot-teleoperate`, another touch_gui): close it. Otherwise just run it again |
+| low Hz in the banner | each register read is a bus round trip; touch_gui reads 3 per tick + Status every 10th (+1 goal write with `--dither`) |

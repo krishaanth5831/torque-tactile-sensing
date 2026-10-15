@@ -28,14 +28,21 @@ from .model import SO101Model
 from .source import Sample, _Base
 from .surface import build_surface
 
-ENCODER_JITTER = 0.45        # ticks rms: measured err std at rest was 0.4-0.6
+# Calibrated on the real follower (2026-10-15 recordings): at rest a reading leaves its 1 s
+# majority value in only ~1-16 % of samples (median ~5 %), which matches 0.08 tick rms.
+# (Real readings sit on one integer for seconds; averaging gains little.)
+ENCODER_JITTER = 0.08        # ticks rms
 DEAD_ZONE = 1                # ticks (CW/CCW_Dead_Zone)
 LOAD_DEADBAND = 18           # load units: real Present_Load reads 0, then jumps to +-20
 TIME_CONSTANT = 0.03         # s, how fast a joint settles after the net force changes
 
 
 class ServoArmSim:
-    def __init__(self, ranges, friction_nm: float = 0.02, p_gain: int = config.P_DEFAULT, seed: int = 0,
+    # Real follower: after a poke joints stay parked up to ~2-3 ticks off at P=16 for tens of
+    # seconds, i.e. static gear friction of ~0.05 N.m per joint (2026-10-15 recordings).
+    REAL_FRICTION_NM = 0.05
+
+    def __init__(self, ranges, friction_nm: float = REAL_FRICTION_NM, p_gain: int = config.P_DEFAULT, seed: int = 0,
                  pose: dict | None = None):
         self.rng = np.random.default_rng(seed)
         self.ranges = ranges
@@ -126,14 +133,16 @@ class SimArmSource(_Base):
     POSE = {"shoulder_pan": 2048, "shoulder_lift": 1500, "elbow_flex": 2500, "wrist_flex": 2300,
             "wrist_roll": 2048, "gripper": 2200}
 
-    def __init__(self, pushes: bool = True, rate_hz: float = 320.0, seed: int = 0, friction_nm: float = 0.02):
+    def __init__(self, pushes: bool = True, rate_hz: float = 320.0, seed: int = 0,
+                 friction_nm: float = ServoArmSim.REAL_FRICTION_NM,
+                 pose: dict | None = None):
         try:
             ranges = config.load_ranges()
         except FileNotFoundError:
             ranges = {j: (900, 3100) for j in self.joints}
         super().__init__(ranges)
         self.sim = ServoArmSim(ranges, friction_nm=friction_nm, seed=seed,
-                               pose={j: self.clamp(j, v) for j, v in self.POSE.items()})
+                               pose={j: self.clamp(j, v) for j, v in (pose or self.POSE).items()})
         self.rng = np.random.default_rng(seed + 1)
         self.dt = 1.0 / rate_hz
         self.pushes = pushes
@@ -193,11 +202,11 @@ class SimArmSource(_Base):
             self.goals[j] = self.clamp(j, v)
         self._sync_goals()
 
-    def set_p_gain(self, joints, p):
+    def set_p_gain(self, joints, p, reaim=True):
         """Softer servo, same pose: re-aim the goal so the holding torque is unchanged."""
         for j in joints:
             k = self.joints.index(j)
-            if self.goals[j] is not None:
+            if reaim and self.goals[j] is not None:
                 e = self.goals[j] - self.sim.pos[k]
                 self.goals[j] = self.clamp(j, round(self.sim.pos[k] + e * self.sim.p_gain[k] / p))
             self.sim.p_gain[k] = p
