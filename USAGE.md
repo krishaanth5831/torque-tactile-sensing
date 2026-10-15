@@ -240,6 +240,7 @@ The real arm's friction is not measured yet; the poke test (§2C) gives the real
 | arrow points backwards | that joint's `JOINT_SIGN` (mirror check A) |
 | model moves differently from the arm | mirror check (A): `JOINT_SIGN` / `JOINT_OFFSET_TICKS` |
 | `servo did not take P_Coefficient` | `--soft` could not set the gain: run without `--soft` |
+| `--soft refused, nothing changed: ...` | a joint is on / near its end stop or far from its goal. Hold the arm up in free space and restart (softening there would make it drive off once lifted) |
 | `SERVO STATUS ERROR` banner | overload / heat / voltage protection tripped; the servo goes soft. Lower `--torque-limit`, let it cool |
 | window frozen, terminal still logging | the window isn't being drawn (hidden / other workspace / screen locked). Bring it to front; Ctrl+C works either way |
 | Wayland `GLFWError: window position` warning | cosmetic, the window still opens |

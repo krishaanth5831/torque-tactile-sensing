@@ -163,6 +163,20 @@ class ArmSource(_Base):
         """Softer servos for sensing (session only). Lowered in `steps` with the goal re-aimed
         each time. With torque on, lerobot keeps Lock=1, so the write lands in RAM and is
         lost at power-off; it is read back to confirm, and close() restores it."""
+        # The re-aim scales err by P_old/P_new, which keeps the torque only if err is gravity
+        # sag. A joint resting on its end stop (goal clamped inside the range, err ~45) would
+        # get a goal ~4x further away and drive there as soon as it is lifted off the stop.
+        pos = self._avg_pos()
+        bad = []
+        for j in joints:
+            lo, hi = self.ranges[j]
+            far = self.goals[j] is not None and abs(self.goals[j] - pos[j]) > 20
+            stop = j != "gripper" and (pos[j] < lo + 25 or pos[j] > hi - 25)
+            if far or stop:
+                bad.append(f"{j} (pos {pos[j]:.0f}, goal {self.goals[j]}, range {lo}-{hi})")
+        if bad:
+            raise RuntimeError("--soft refused, nothing changed: " + "; ".join(bad) +
+                               ". Hold the arm up in free space, away from its end stops, and restart.")
         cur = self._r("P_Coefficient")
         for j in joints:
             self._orig_p.setdefault(j, cur[j])
