@@ -72,8 +72,7 @@ is sharper on the wrist, but less sure on the upper arm (§4).
 
 ### First-time checks (once)
 
-**A. Mirror check** (done 2026-10-15; wrist_roll needed +1024 ticks). Re-do it after any
-recalibration:
+**A. Mirror check.** Re-do it after any recalibration:
 
 ```bash
 python scripts/touch_gui.py --limp     # never enables torque: move it by hand. SUPPORT the arm

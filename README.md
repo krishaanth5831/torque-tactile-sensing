@@ -148,7 +148,7 @@ ROS install's pytest plugins out.
 - Verified:
   - all unit tests
   - every script end to end on `--fake`, with a window and headless
-  - on the real follower (2026-10-15): mirror check (wrist_roll offset +1024 ticks),
+  - on the real follower (2026-10-15): mirror check,
     loop rate ~320 Hz in hold mode / ~240 Hz in teleop, P_Coefficient 16, gripper
     Torque_Limit 500, Present_Current unsigned and only 1–7 raw units (unused)
   - the 2026-10-15 real recordings replayed through the new estimator: time spent in
