@@ -2,17 +2,20 @@
 
 A MuJoCo window shows the arm mirroring the real follower. When something pushes it:
   * an arrow on every joint axis shows the external torque that joint feels
-    (grey = normal, yellow -> red = more and more sure it is a touch)
-  * the touched link turns red
-  * a red arrow shows WHERE the push is and WHICH WAY it pushes (orange + a big
-    halo = ambiguous: only the link is known, the point and direction are a guess)
-  * --fake only: a cyan arrow shows the TRUE simulated push, to compare
-  * top-left text: mode, state, loop rate. Bottom-left: per-joint torque ~N.m and z.
+    (grey = noise level, yellow -> red = clearly more than noise)
+  * a HEAT CLOUD on the arm's surface: every point where a finger could be pressing to
+    produce exactly these torques (red = most likely). Small cloud = it knows where.
+    A cloud smeared along a link = physics can't tell (see USAGE.md: what it can know)
+  * a red ball + arrow at the most likely point: where, and which way you push
+  * --fake only: cyan = the TRUE simulated push, and the error in cm
+  * top: TOUCH <link>  +-<cm>  ~<N>. Bottom-left: per-joint torque ~N.m and z.
 
 Modes:
-    python scripts/touch_gui.py --fake                    # simulated arm holding + 3D pushes
-    python scripts/touch_gui.py --fake --teleop           # simulated leader moving it around
+    python scripts/touch_gui.py --fake                    # simulated arm + simulated finger pushes
     python scripts/touch_gui.py                           # real follower holds its pose: push it
+    python scripts/touch_gui.py --soft 4                  # same, softer servos: finer touch
+    python scripts/touch_gui.py --poke                    # accuracy test: double-click a spot on
+                                                          # the model, poke it on the real arm
     python scripts/touch_gui.py --teleop                  # leader drives follower, push the follower
     python scripts/touch_gui.py --teleop --record         # record no-touch motion for fit_model.py
     python scripts/touch_gui.py --teleop --model models/load_model.json   # touch while MOVING
@@ -23,6 +26,9 @@ Keys (window focused): R = re-learn the baseline now (don't touch while it learn
 States: LEARNING (don't touch) -> WATCHING (still, most sensitive) -> TOUCH.
 While the command moves: MOVING (with --model), or "no model" (no detection while moving).
 """
+import json
+import os
+import sys
 import threading
 import time
 
@@ -32,9 +38,10 @@ import numpy as np
 from _common import RateMeter, base_parser, open_and_report
 
 from tactile import config
+from tactile.contact import ContactLocalizer
 from tactile.dynmodel import LoadModel
 from tactile.estimator import TouchEstimator
-from tactile.logger import CsvLogger
+from tactile.logger import DATA_DIR, CsvLogger
 from tactile.model import SO101Model
 from tactile.teleop import FakeLeader, LeaderArm, Teleop
 
@@ -44,32 +51,45 @@ p.add_argument("--leader-port", default=config.LEADER_PORT)
 p.add_argument("--model", default=None, help="LoadModel json from fit_model.py (touch while moving)")
 p.add_argument("--record", action="store_true", help="label the log as no-touch motion for fit_model.py")
 p.add_argument("--torque-limit", type=int, default=500, help="follower Torque_Limit, 0..1000")
+p.add_argument("--soft", type=int, default=None, metavar="P",
+               help="hold mode: lower the servos' P gain to P (lerobot uses 16) while this runs. "
+                    "Softer = more deflection per newton = finer touch. Restored on exit")
 p.add_argument("--max-step", type=float, default=40, help="teleop: max goal change per tick, ticks")
-p.add_argument("--z-on", type=float, default=6.0)
-p.add_argument("--z-off", type=float, default=3.0)
-p.add_argument("--z-loc", type=float, default=2.0, help="joints above this |z| count when picking the link")
+p.add_argument("--d-on", type=float, default=6.0, help="touch starts when the noise-weighted torque exceeds this")
+p.add_argument("--d-off", type=float, default=3.5, help="... and ends below this")
+p.add_argument("--poke", action="store_true",
+               help="accuracy test: double-click the model where you will poke, poke the real arm there")
 p.add_argument("--no-truth", action="store_true", help="fake: hide the true-push arrow")
 p.add_argument("--limp", action="store_true",
                help="never enable torque (mirror check: move the arm by hand). SUPPORT THE ARM")
 args = p.parse_args()
 if args.limp and args.teleop:
     p.error("--limp and --teleop don't mix (teleop has to drive the follower)")
+if args.soft is not None and (args.teleop or args.limp):
+    p.error("--soft is for hold mode (in teleop a soft arm sags off the leader's pose)")
+if args.soft is not None and not 1 <= args.soft <= 32:
+    p.error("--soft P: 1..32 (lerobot 16, firmware default 32)")
 
 J = config.JOINTS
 src = open_and_report(args, full=False, cartesian=args.fake, pushes=not args.record)  # record = no touch
 lm = LoadModel.load(args.model) if args.model else None
 if lm:
     print("[tactile] load model R^2:", {j: round(v, 2) for j, v in lm.r2.items()})
-est = TouchEstimator(SO101Model(ranges=src.ranges), lm, args.z_on, args.z_off, z_loc=args.z_loc)
+t_build = time.time()
+loc = ContactLocalizer(SO101Model(ranges=src.ranges))
+print(f"[tactile] touch surface: {loc.s.n} points on {', '.join(loc.links)} ({time.time() - t_build:.1f} s)")
+est = TouchEstimator(SO101Model(ranges=src.ranges), lm, p_gain=args.soft or config.P_DEFAULT,
+                     d_on=args.d_on, d_off=args.d_off, localizer=loc)
 leader = None
 if args.teleop:
     leader = FakeLeader() if args.fake else LeaderArm(args.leader_port)
 tp = Teleop(leader, src.ranges, max_step=args.max_step) if leader else None
-name = "free_motion" if args.record else "touch_gui"
-log = CsvLogger(name, J, extra=["state", "touch", "contact_link"] + [f"z_{j}" for j in J], fake=args.fake)
+name = "free_motion" if args.record else "poke" if args.poke else "touch_gui"
+log = CsvLogger(name, J, extra=["state", "touch", "d", "contact_link", "cx", "cy", "cz", "spread_cm"]
+                + [f"z_{j}" for j in J], fake=args.fake)
 
 lock = threading.Lock()
-shared = {"pos": None, "out": None, "truth": None, "hz": 0.0, "status": {}}
+shared = {"pos": None, "out": None, "truth": None, "hz": 0.0, "status": {}, "contact": None}
 stop = threading.Event()
 relearn = threading.Event()
 
@@ -88,6 +108,9 @@ def worker():
 def _worker():
     if not args.limp:
         src.hold_here(J, args.torque_limit)
+        if args.soft is not None:
+            print(f"[tactile] softening servos: P_Coefficient -> {args.soft} (restored on exit)")
+            src.set_p_gain(J, args.soft)
     rate = RateMeter()
     n = 0
     status = {}
@@ -95,19 +118,22 @@ def _worker():
         s = src.read()
         if tp:
             src.set_goal(tp.goals(s.t, s.pos))
-        if n % 10 == 0:
+        if n % 10 == 0 and not args.fake:
             status = {j: v for j, v in src.read_status().items() if v}
         n += 1
         if relearn.is_set():
             est.relearn()
             relearn.clear()
         o = est.update(s.t, dict(src.goals), s.pos, s.load)
-        log.write(s, {"state": o.state, "touch": int(o.active.any()),
-                      "contact_link": o.contact.link if o.contact else "",
-                      **{f"z_{j}": round(float(o.z[k]), 2) for k, j in enumerate(J)}})
         with lock:
+            c = shared["contact"] if o.touching else None
             shared.update(pos=dict(s.pos), out=o, hz=rate.tick(), status=status,
                           truth=getattr(src, "true_push", None))
+        log.write(s, {"state": o.state, "touch": int(o.touching), "d": round(o.d, 2),
+                      "contact_link": c.link if c else "",
+                      **({"cx": round(float(c.point[0]), 4), "cy": round(float(c.point[1]), 4),
+                          "cz": round(float(c.point[2]), 4), "spread_cm": round(c.spread_cm, 2)} if c else {}),
+                      **{f"z_{j}": round(float(o.z[k]), 2) for k, j in enumerate(J)}})
 
 
 # ---------------------------------------------------------------------- drawing
@@ -115,7 +141,8 @@ vm = SO101Model(ranges=src.ranges)          # the viewer's own model + data
 m, d = vm.m, vm.d
 orig_rgba = m.geom_rgba.copy()
 visual = [g for g in range(m.ngeom) if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0]
-RED, ORANGE, CYAN = np.array([1, .1, .1, 1]), np.array([1, .55, 0, 1]), np.array([0, .9, 1, .9])
+RED, CYAN, GREEN = np.array([1, .1, .1, 1]), np.array([0, .9, 1, .9]), np.array([.1, 1, .2, .9])
+STOP_MARGIN = 25     # ticks: closer than this to a calibrated end = probably resting on the stop
 
 
 def add_arrow(scn, a, b, rgba, width):
@@ -145,13 +172,57 @@ def force_arrow(scn, point, force, rgba):
 
 
 def heat(z):
-    a = min(max((abs(z) - args.z_off) / (args.z_on * 1.5 - args.z_off), 0), 1)
-    if abs(z) < args.z_off:
+    a = min(max((abs(z) - 2) / 6, 0), 1)
+    if abs(z) < 2:
         return np.array([.6, .6, .6, .5])
     return np.array([1, 1 - a, 0, .95])
 
 
-def draw(viewer, pos, o, truth, hz, status):
+def on_stops(pos):
+    out = []
+    for j in J[:5]:
+        lo, hi = src.ranges[j]
+        if pos[j] < lo + STOP_MARGIN or pos[j] > hi - STOP_MARGIN:
+            out.append(j)
+    return out
+
+
+# ---------------------------------------------------------------------- poke test
+poke = {"target": None, "results": [], "last": None, "last_id": 0}
+
+
+def poke_target():
+    """The spot double-clicked on the model: (body, body-local point)."""
+    pert = viewer_ref[0].perturb
+    if pert.select <= 0:
+        return None
+    return int(pert.select), np.array(pert.localpos)
+
+
+def target_world(tgt):
+    b, local = tgt
+    return d.xpos[b] + d.xmat[b].reshape(3, 3) @ local
+
+
+def poke_update(o, c):
+    """Score the final estimate of every finished touch against the clicked target."""
+    if o is not None and o.touching and c is not None and poke["target"] is not None:
+        poke["last"] = (o.touch_id, c, target_world(poke["target"]).copy(), poke["target"])
+    if poke["last"] and (o is None or not o.touching or o.touch_id != poke["last"][0]):
+        tid, c, tw, (b, local) = poke["last"]
+        poke["last"] = None
+        link_true = loc.s.link_of_body.get(b, m.body(b).name)
+        r = {"target_body": m.body(b).name, "target_link": link_true, "target_local": local.tolist(),
+             "est_link": c.link, "err_cm": float(np.linalg.norm(c.point - tw) * 100),
+             "spread_cm": c.spread_cm, "force_n": float(np.linalg.norm(c.force))}
+        poke["results"].append(r)
+        same = [x["err_cm"] for x in poke["results"] if x["target_local"] == r["target_local"]]
+        print(f"[poke] #{len(poke['results'])}: target {link_true}, estimate {c.link}, error "
+              f"{r['err_cm']:.1f} cm (claimed +-{c.spread_cm:.1f}), ~{r['force_n']:.1f} N  | this spot: "
+              f"median {np.median(same):.1f} cm over {len(same)}")
+
+
+def draw(viewer, pos, o, c, truth, hz, status):
     d.qpos[:] = vm.raw_to_qpos(pos)
     mujoco.mj_forward(m, d)
     m.geom_rgba[:] = orig_rgba
@@ -160,51 +231,81 @@ def draw(viewer, pos, o, truth, hz, status):
     if o is not None:
         for k, j in enumerate(J[:5]):                 # torque arrows along each joint axis
             jid = vm.jid[k]
-            tau = o.tau_nm[k] * config.JOINT_SIGN[j]        # +tick direction -> model axis
-            L = float(np.clip(abs(tau) / 0.4 * 0.08, 0, 0.12))
+            tau = o.tau_nm[k] * vm.torque_tick_to_model[k]
+            L = float(np.clip(abs(tau) / 0.3 * 0.08, 0, 0.12))
             axis = d.xaxis[jid] * np.sign(tau)
             add_arrow(scn, d.xanchor[jid], d.xanchor[jid] + axis * L, heat(o.z[k]), 0.004)
-        c = o.contact
-        if c is not None:
-            b = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, c.link)
-            for g in visual:
-                if m.geom_bodyid[g] == b:
-                    m.geom_rgba[g] = [1, .25, .25, 1]
-            if c.ambiguous:
-                add_sphere(scn, c.point, 0.035, np.array([1, .55, 0, .25]))
-                force_arrow(scn, c.point, c.force, ORANGE)
-            else:
-                add_sphere(scn, c.point, 0.01, RED)
-                force_arrow(scn, c.point, c.force, RED)
+    if c is not None:
+        b = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, c.link)
+        for g in visual:
+            if m.geom_bodyid[g] == b:
+                m.geom_rgba[g] = [1, .55, .55, 1]
+        for w, pt in zip(c.heat_w[::-1], c.heat_pts[::-1]):       # faint first, hottest on top
+            if w > 0.02:
+                add_sphere(scn, pt, 0.003 + 0.003 * w, np.array([1, 1 - w, 0, 0.25 + 0.6 * w]))
+        add_sphere(scn, c.point, 0.008, RED)
+        force_arrow(scn, c.point, c.force, RED)
     if truth is not None and not args.no_truth:
         _, tp_, tf = truth
-        add_sphere(scn, tp_, 0.007, CYAN)
+        add_sphere(scn, tp_, 0.006, CYAN)
         force_arrow(scn, tp_, tf, CYAN)
+    if args.poke and poke["target"] is not None:
+        add_sphere(scn, target_world(poke["target"]), 0.007, GREEN)
 
     mode = ("FAKE " if args.fake else "") + ("TELEOP" if args.teleop else "LIMP (mirror check)" if args.limp
-                                               else "HOLD")
+                                               else "HOLD") + (f"  soft P={args.soft}" if args.soft else "")
     if args.record:
         mode += "  RECORDING no-touch motion"
-    state = o.state if o else "starting"
+    if args.poke:
+        mode += "  POKE TEST"
+    state = (o.state + (f"  ({o.note})" if o.note else "")) if o else "starting"
     big = state
-    if o is not None and o.contact is not None:
-        c = o.contact
+    if c is not None:
         fN = np.linalg.norm(c.force)
-        big = f"TOUCH  {c.link}  ~{fN:.1f} N" + ("  (link only: point/direction a guess)" if c.ambiguous else "")
+        big = f"TOUCH  {c.link}  +-{c.spread_cm:.1f} cm  ~{fN:.1f} N"
+        top = sorted(c.link_prob.items(), key=lambda kv: -kv[1])
+        if top[0][1] < 0.85:
+            big += "\n" + "  ".join(f"{k} {v:.0%}" for k, v in top[:3] if v > 0.05)
+        if truth is not None and not args.no_truth:
+            big += f"\nerror vs true push: {np.linalg.norm(c.point - truth[1]) * 100:.1f} cm"
+    stops = on_stops(pos)
+    if stops and not args.limp:
+        big = (f"{', '.join(stops)} resting on its END STOP: the stop takes the push, not the motor.\n"
+               "Lift the arm into free space (or move the leader), then press R")
     if status:
         big = f"SERVO STATUS ERROR {status}"
     left = "\n".join(J)
     right = "\n".join(
-        f"{o.tau_nm[k]:+.2f} N.m  z{o.z[k]:+6.1f}  " + "|" * int(min(abs(o.z[k]), 30)) if o else "-"
+        f"{o.tau_nm[k]:+.3f} N.m  z{o.z[k]:+6.1f}  " + "|" * int(min(abs(o.z[k]), 30)) if o else "-"
         for k in range(len(J)))
-    viewer.set_texts([
+    br = "~ = uncalibrated scale\nR = re-learn baseline"
+    if args.poke:
+        res = poke["results"]
+        br = ("double-click the model where you will poke (green),\nthen poke that spot on the real arm.\n"
+              + (f"{len(res)} pokes, median error {np.median([r['err_cm'] for r in res]):.1f} cm" if res
+                 else "no pokes yet"))
+    texts[0] = [
         (mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPLEFT, "mode\nstate\nrate",
          f"{mode}\n{state}\n{hz:.0f} Hz"),
         (mujoco.mjtFontScale.mjFONTSCALE_200, mujoco.mjtGridPos.mjGRID_TOP, big, ""),
         (mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_BOTTOMLEFT, left, right),
-        (mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
-         "~ = uncalibrated (load/1000 x 2.94 N.m)\nR = re-learn baseline", ""),
-    ])
+        (mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT, br, ""),
+    ]
+    new_texts.set()
+
+
+# viewer.set_texts() waits for the render thread to take the previous text. When the window
+# is not being drawn (hidden, other workspace, screen locked) that wait never ends; in the
+# main loop it froze the window, --duration and Ctrl+C. So texts go through this thread.
+texts = [None]
+new_texts = threading.Event()
+
+
+def text_pump(viewer):
+    while not stop.is_set():
+        if new_texts.wait(0.1):
+            new_texts.clear()
+            viewer.set_texts(texts[0])
 
 
 def on_key(keycode):
@@ -212,12 +313,17 @@ def on_key(keycode):
         relearn.set()
 
 
+viewer_ref = [None]
 th = threading.Thread(target=worker, daemon=True)
 t_end = time.time() + args.duration if args.duration else None
+next_loc = 0.0
+contact = None
 try:
     th.start()
     with mujoco.viewer.launch_passive(m, d, key_callback=on_key, show_left_ui=False,
                                       show_right_ui=False) as viewer:
+        viewer_ref[0] = viewer
+        threading.Thread(target=text_pump, args=(viewer,), daemon=True).start()
         viewer.cam.lookat[:] = [0.15, 0.0, 0.15]
         viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = 0.85, 135, -22
         while viewer.is_running() and th.is_alive():
@@ -226,25 +332,52 @@ try:
             with lock:
                 pos, o, truth = shared["pos"], shared["out"], shared["truth"]
                 hz, status = shared["hz"], shared["status"]
+            if o is not None and time.time() >= next_loc:       # where: ~25 Hz, in this thread
+                next_loc = time.time() + 0.04
+                contact = est.localize() if o.touching else None
+                with lock:
+                    shared["contact"] = contact
+            if args.poke:
+                with viewer.lock():
+                    tgt = poke_target()
+                if tgt is not None:
+                    poke["target"] = tgt
+                poke_update(o, contact)
             if pos is not None:
                 with viewer.lock():
-                    draw(viewer, pos, o, truth, hz, status)
+                    draw(viewer, pos, o, contact if (o is not None and o.touching) else None, truth, hz, status)
                 viewer.sync()
-            time.sleep(1 / 40)
+            time.sleep(1 / 60)
+except KeyboardInterrupt:
+    print("\n[tactile] Ctrl+C: closing")
+finally:
     # Leaving the `with` only ASKS the viewer to close. Its render thread is a daemon
     # with no handle; if Python's atexit glfw.terminate() runs while it still renders,
     # the process segfaults. Wait for it (MuJoCo 3.8.1, names it "..._launch_internal").
+    # In `finally` so Ctrl+C waits too: skipping this made Ctrl+C segfault / hang.
     for t in threading.enumerate():
         if "_launch_internal" in t.name:
             t.join(timeout=5)
-finally:
     stop.set()
     th.join(timeout=3)
     log.close()
     if leader:
         leader.close()
     src.close(release=args.release_on_exit)
+    if args.poke and poke["results"]:
+        out = DATA_DIR / f"poke_results_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        out.write_text(json.dumps(poke["results"], indent=1))
+        e = np.array([r["err_cm"] for r in poke["results"]])
+        ok = np.mean([r["est_link"] == r["target_link"] for r in poke["results"]])
+        print(f"[poke] {len(e)} pokes: median error {np.median(e):.1f} cm, 80% within "
+              f"{np.percentile(e, 80):.1f} cm, link right {ok:.0%}  -> {out}")
     if args.record and not worker_error:
         print(f"\nNext: python scripts/fit_model.py {log.path}")
 if worker_error:
-    raise SystemExit(f"[tactile] the sensing loop crashed: {worker_error[0]!r} (traceback above)")
+    print(f"[tactile] the sensing loop crashed: {worker_error[0]!r} (traceback above)", file=sys.stderr)
+# Everything that matters is closed above (CSV, servo P gain + torque limit, ports). Exit
+# NOW: a viewer thread stuck inside MuJoCo's C++ (window not being drawn) would otherwise
+# hang interpreter shutdown, and glfw's atexit hook can segfault on a live render thread.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(1 if worker_error else 0)

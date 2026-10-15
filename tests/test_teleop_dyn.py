@@ -39,7 +39,7 @@ def test_teleop_ramps_and_limits_step():
 
 
 def test_load_model_fits_fake_gravity_and_motion():
-    """Synthetic: load = holding drive (MuJoCo gravity) + viscous + noise; the model
+    """Synthetic: err = gravity sag (MuJoCo holding drive / stiffness) + noise; the model
     built only from commanded goals must explain it well."""
     m = SO101Model(ranges={j: (900, 3100) for j in config.JOINTS})
     rng = np.random.default_rng(0)
@@ -48,9 +48,9 @@ def test_load_model_fits_fake_gravity_and_motion():
         t += 1 / 60
         goal = {j: 2048 + 400 * np.sin(0.4 * t * (k + 1) + k) for k, j in enumerate(config.JOINTS)}
         hold = m.holding_load(goal)
-        load = {j: hold[j] + rng.normal(0, 5) for j in config.JOINTS}
-        rows.append({"t": t, "goal": goal, "load": load})
+        y = {j: hold[j] / 9 + rng.normal(0, 0.5) for j in config.JOINTS}     # 9 load units per tick
+        rows.append({"t": t, "goal": goal, "y": y})
     lm = LoadModel.fit(rows, m)
     for j in ["shoulder_lift", "elbow_flex"]:
         assert lm.r2[j] > 0.95, (j, lm.r2[j])
-        assert lm.sigma[j] < 8
+        assert lm.sigma[j] < 0.8

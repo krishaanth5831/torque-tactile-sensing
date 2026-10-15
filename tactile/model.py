@@ -1,26 +1,9 @@
-"""The SO-101 as a MuJoCo model: raw ticks -> joint angles, gravity, and contact localisation.
+"""The SO-101 as a MuJoCo model: raw ticks -> joint angles, gravity, Jacobians.
 
-Where is the push coming from? A force F pressing on the arm at point p produces joint
-torques   tau = J(p)^T F   (J = the translational Jacobian of point p). Two facts invert it:
-
-1. ISOLATION. A push on link k only loads joints 0..k (the joints between it and the base).
-   Joints further out feel nothing. So the MOST DISTAL joint that feels a torque tells
-   you which link was touched.
-2. FIT. On that link, try candidate points along it. For each one, solve
-   J(p)^T F = tau by least squares. The point whose fit leaves the smallest error is the
-   best guess, and F is the force.
-
-Be honest about the limits:
-- On the shoulder / upper arm / lower arm only 1-3 joints respond. With 3 unknowns in F
-  the fit is underdetermined: every point fits. We then report the link, its midpoint
-  and the smallest force that explains the torques (a lower bound, `ambiguous=True`).
-  From the wrist on, 4-5 joints respond and the point is actually constrained.
-- A force whose line passes through a joint axis gives that joint zero torque. That can
-  fool the isolation step into picking a more proximal link.
+Contact localisation lives in contact.py (a probability over the whole arm surface).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import mujoco
@@ -31,16 +14,6 @@ from . import config
 SCENE_XML = Path(__file__).resolve().parent.parent / "assets/so101/scene.xml"
 ARM = config.JOINTS[:5]                     # gripper handled separately
 TICKS_TO_RAD = 2 * np.pi / 4096
-
-
-@dataclass
-class Contact:
-    link: str                 # body name in the model
-    joint_index: int          # most distal joint that felt it
-    point: np.ndarray         # world xyz (m) of the best-guess contact point
-    force: np.ndarray         # world force vector (N) applied BY the hand ON the arm
-    fit_error: float          # |J^T F - tau| / |tau|, 0 = perfect
-    ambiguous: bool           # True: point is a guess (link midpoint), force a lower bound
 
 
 class SO101Model:
@@ -83,92 +56,39 @@ class SO101Model:
         self.d.qvel[:] = 0
         mujoco.mj_forward(self.m, self.d)
 
-    # ------------------------------------------------------------------ torques <-> load units
+    # ------------------------------------------------------------------ torques: model axes <-> servo ticks
     def holding_load(self, raw: dict[str, float]) -> dict[str, float]:
         """Drive (load units, tick direction) needed to hold this pose against gravity.
         qfrc_bias is the generalised force the actuators must apply at rest."""
         self.set_pose(raw)
-        return {j: self.model_to_tick(j, self.d.qfrc_bias[self.dof[k]]) / config.NM_PER_LOAD
-                for k, j in enumerate(config.JOINTS)}
+        tau = self.model_to_tick(self.d.qfrc_bias)
+        return {j: tau[k] / config.NM_PER_LOAD for k, j in enumerate(config.JOINTS)}
 
-    @staticmethod
-    def model_to_tick(joint: str, tau: float) -> float:
-        """Torque about the model joint axis -> torque in the servo's +tick direction."""
-        return tau * config.JOINT_SIGN.get(joint, 1)
+    def model_to_tick(self, tau_model: np.ndarray) -> np.ndarray:
+        """Generalised torque (model axes, length nv) -> per config.JOINTS servo torque, N.m
+        in the +tick direction."""
+        return np.array([tau_model[self.dof[k]] for k in range(len(config.JOINTS))]) / self.torque_tick_to_model
 
-    def tick_to_model(self, tau_tick: dict[str, float]) -> np.ndarray:
-        tau = np.zeros(self.m.nv)
-        for k, j in enumerate(config.JOINTS):
-            tau[self.dof[k]] = tau_tick.get(j, 0.0) * config.JOINT_SIGN.get(j, 1)
-        return tau
+    @property
+    def torque_tick_to_model(self) -> np.ndarray:
+        """Per config.JOINTS: model-axis torque per unit of servo (+tick direction) torque.
+        Work is the same on both sides: tau_model * dq_model = tau_servo * dq_servo, so the
+        factor is (servo rad per tick) / (model rad per tick). +-1 for the arm joints; the
+        gripper is mapped linearly from its calibrated range, so it differs from 1."""
+        out = np.array([float(config.JOINT_SIGN.get(j, 1)) for j in config.JOINTS])
+        if self.ranges is not None:
+            k = config.JOINTS.index("gripper")
+            lo, hi = self.ranges["gripper"]
+            lo_m, hi_m = self.m.jnt_range[self.jid[k]]
+            model_per_tick = (hi_m - lo_m) / max(hi - lo, 1)
+            out[k] = TICKS_TO_RAD / model_per_tick * (-1 if config.GRIPPER_MODEL_FLIP else 1)
+        return out
 
     # ------------------------------------------------------------------ geometry
     def jac(self, point: np.ndarray, body: int) -> np.ndarray:
         mujoco.mj_jac(self.m, self.d, self._jacp, None, point, body)
         return self._jacp.copy()
 
-    def link_segment(self, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """Start/end (world) of the link moved by joint k: from its joint anchor to the
-        next joint's anchor, or to the gripper tip for the wrist_roll link."""
-        a = self.d.xanchor[self.jid[k]].copy()
-        b = (self.d.site_xpos[self.tip_site].copy() if k == len(ARM) - 1
-             else self.d.xanchor[self.jid[k + 1]].copy())
-        return a, b
-
     def torque_from_force(self, body: int, point: np.ndarray, force: np.ndarray) -> np.ndarray:
         """Generalised torques (model axes) that a force at a point on `body` produces."""
         return self.jac(point, body).T @ force
-
-    # ------------------------------------------------------------------ localisation
-    def localize(self, tau: np.ndarray, active: np.ndarray, n_candidates: int = 25) -> Contact | None:
-        """tau: external generalised torque (model axes, N.m), length nv.
-        active: bool per config.JOINTS (detector says this joint is being pushed)."""
-        arm_active = [k for k in range(len(ARM)) if active[k]]
-        if not arm_active:
-            if active[len(ARM)]:
-                b = self.body_of_joint[len(ARM)]
-                return Contact(self.m.body(b).name, len(ARM), self.d.xpos[b].copy(), np.zeros(3), 0.0, True)
-            return None
-        k = max(arm_active)
-        if k + 1 < 4:
-            # Underdetermined: report the link midpoint and the min-norm force.
-            body = self.body_of_joint[k]
-            cols = [self.dof[i] for i in range(k + 1)]
-            a, b = self.link_segment(k)
-            p = a + 0.5 * (b - a)
-            F, err = self._fit(p, body, cols, tau)
-            return Contact(self.m.body(body).name, k, p, F, err, True)
-        # Constrained (wrist on): search points on link k AND on the next link out. A push
-        # on the next link whose line passes near that joint's axis leaves it almost
-        # torque-free, so it was not flagged; the fit with its ~0 torque still finds it.
-        best = None
-        for kk in (k, k + 1):
-            if kk >= len(ARM):
-                continue
-            body = self.body_of_joint[kk]
-            cols = [self.dof[i] for i in range(kk + 1)]
-            for p, s in self.candidates(kk, n_candidates):
-                F, err = self._fit(p, body, cols, tau)
-                score = err + 0.02 * abs(s - 0.5) + (0.02 if kk != k else 0.0)
-                if best is None or score < best[0]:
-                    best = (score, err, p, F, kk, body)
-        _, err, p, F, kk, body = best
-        return Contact(self.m.body(body).name, kk, p, F, err, False)
-
-    def _fit(self, p, body, cols, tau):
-        t = tau[cols]
-        Jt = self.jac(p, body)[:, cols]               # 3 x n_joints
-        F, *_ = np.linalg.lstsq(Jt.T, t, rcond=None)  # min-norm F if underdetermined
-        return F, float(np.linalg.norm(Jt.T @ F - t) / (np.linalg.norm(t) + 1e-12))
-
-    def candidates(self, k: int, n: int = 25):
-        """Candidate contact points on link k: along its centre line, plus the centres of
-        its collision geoms (the real surfaces, e.g. the jaws, off the roll axis).
-        Yields (point, s) with s = 0..1 position along the link (geoms: 0.5)."""
-        a, b = self.link_segment(k)
-        for s in np.linspace(0.05, 0.95, n):
-            yield a + s * (b - a), s
-        body = self.body_of_joint[k]
-        for g in range(self.m.body_geomadr[body], self.m.body_geomadr[body] + self.m.body_geomnum[body]):
-            if self.m.geom_contype[g] or self.m.geom_conaffinity[g]:      # collision geoms only
-                yield self.d.geom_xpos[g].copy(), 0.5

@@ -1,33 +1,41 @@
 # torque-tactile-sensing
 
 Touch for the SO-101 **without adding sensors**: read what the STS3215 servos already
-report (load, current, position error) and turn it into "someone is pushing me" and
-"I am squeezing a tomato this hard".
+report and turn it into "someone is touching me, here, this hard, this way" (and, parked
+for later, "I am squeezing a tomato this hard").
 
-- **[USAGE.md](USAGE.md)**: every command. Covers testing without the arm, the real arm
-  on its own, using it during teleoperation, and the one-time checks.
+- **[USAGE.md](USAGE.md)**: every command. Testing without the arm, the real arm on its
+  own, the poke accuracy test, teleoperation, how it works and what physics allows.
 - **[IDEAS.md](IDEAS.md)**: the physics, the idea ladder, and what's next.
 
-Current focus: a sense of touch for the arm (where am I pushed, which way, how hard).
+Current focus: a sense of touch for the arm (where am I touched, which way, how hard).
 The tomato / grip-force work is parked for now (`squeeze.py` still works).
 
 ## The touch GUI
 
 ```bash
 conda activate lerobot
-python scripts/touch_gui.py --fake               # no arm needed: simulated pushes
-python scripts/touch_gui.py                      # real follower holds still: push it
+python scripts/touch_gui.py --fake               # no arm needed: simulated finger pushes
+python scripts/touch_gui.py                      # real follower holds still: touch it
+python scripts/touch_gui.py --soft 4             # softer servos: finer touch
+python scripts/touch_gui.py --poke               # measure the real accuracy, in cm
 python scripts/touch_gui.py --teleop             # leader drives it (replaces lerobot-teleoperate)
 ```
 
 A MuJoCo window shows the SO-101 mirroring the real arm:
 - arrows on each joint axis for the torque it feels
-- the touched link in red
-- an arrow for where the push is and which way it goes (orange = only the link is
-  certain)
-- in `--fake`, the true push in cyan
+- a **heat cloud on the arm's surface**: every point where a fingertip could be pressing
+  to produce exactly these torques. Small cloud = it knows where. Smeared = physics can't
+  tell (proximal links, see USAGE.md §4)
+- a red ball + arrow at the most likely point: where, and which way you push, with
+  `+-cm` and `~N` on top
+- in `--fake`, the true push in cyan and the error in cm
 
-See USAGE.md §2–3.
+How: each servo's position error is a torque sensor (it is a P controller), averaged
+below one tick. Every point of the real link surfaces is scored by how well a push-only
+fingertip force there explains all six joint torques (`τ = Jᵀ F`). On the simulated arm
+that finds the gripper to ~1 cm, the wrist to ~2–3 cm, forearm and upper arm to ~4 cm
+(`scripts/bench_touch.py`). The real-arm number comes from the poke test.
 
 ## Older step-by-step tools (watch first)
 
@@ -82,12 +90,15 @@ window, and `--duration N` stops after N seconds.
   servo enforces it itself, so it is the real force ceiling. It is restored on exit
   and resets on power-up anyway.
 - At startup each script prints `Torque_Limit`, `Max_Torque_Limit`, `Protection_Current`,
-  `Overload_Torque` and `P_Coefficient`. A bare bus does not run lerobot's
+  `Overload_Torque`, `P_Coefficient`, `Minimum_Startup_Force` and the dead zones. A bare bus does not run lerobot's
   `configure()`, so lerobot's gripper caps (50 %) and P=16 are only there if the EEPROM
   has them. Check the printout.
 - All goals are raw ticks clamped to `range_min/range_max` from
   `follower_white.json`. There is no lerobot normalisation, so the `use_degrees` trap
   doesn't apply.
+- `touch_gui.py --soft P` writes `P_Coefficient` while torque is on (Lock=1, so RAM
+  only), re-aims the goals so the pose holds, and restores the original P on exit.
+  lerobot also rewrites P=16 every time it connects.
 - On exit torque stays **on** (the arm holds instead of dropping). `--release-on-exit`
   makes it go limp, so support the arm.
 - A non-zero `Status` register (overload/heat/voltage trip) is shown in purple/red. A
@@ -105,23 +116,28 @@ window, and `--duration N` stops after N seconds.
 ```
 assets/so101/    MuJoCo SO-101 model (Menagerie, Apache-2.0, see SOURCE.md)
 tactile/
-  config.py      ports, joint ids, ranges, raw<->model signs/offsets, load->N.m, FORCE_SIGN
-  source.py      ArmSource (real bus, raw units) + FakeSource (P-servo sim, optional 3D pushes)
-  model.py       MuJoCo model: raw->angles, gravity, contact localisation (tau = J^T F)
-  estimator.py   TouchEstimator: LEARNING / WATCHING / MOVING / TOUCH, z-scores, contact
-  dynmodel.py    expected load while moving, from COMMANDED motion only (fit_model.py)
+  config.py      ports, joint ids, ranges, raw<->model signs/offsets, err->N.m (K per P gain),
+                 rest band (dead zone + friction), touchable bodies
+  source.py      ArmSource (real bus, raw units, --soft P gain with re-aim) + FakeSource (2D scripts)
+  sim.py         ServoArmSim / SimArmSource: realistic simulated follower + fingertip pushes
+  surface.py     touchable surface points + normals, sampled from the link meshes
+  contact.py     ContactLocalizer: push-only force fit at every surface point -> probability
+  model.py       MuJoCo model: raw->angles, gravity, Jacobians, servo<->model torque
+  estimator.py   TouchEstimator: LEARNING / WATCHING / MOVING / TOUCH on windowed err
+  dynmodel.py    expected err while moving, from COMMANDED motion only (fit_model.py)
   teleop.py      leader -> follower teleop in our own loop (ramp, step cap, clamp)
   detect.py      Baseline, PhaseBaseline, Hysteresis, analyse_squeeze (pure numpy, tested)
   liveplot.py    threaded matplotlib window (the bus loop never waits for drawing)
   logger.py      one new timestamped CSV per run
 scripts/
-  touch_gui.py   the 3D touch GUI: hold / teleop / record, --fake
-  fit_model.py   fit the moving-arm load model from a no-touch recording
+  touch_gui.py   the 3D touch GUI: hold / soft / poke / teleop / record, --fake
+  bench_touch.py localisation accuracy per link on the simulated arm (no window)
+  fit_model.py   fit the moving-arm err model from a no-touch recording
   live_view.py   step 0, look at signals (optionally hold joints)
   push_detect.py step 1, hold / wiggle push detection, stop / comply reactions
   probe_gripper.py  which raw end of the gripper is closed
   squeeze.py     step 2, contact, stiffness, target grip, yield (crush) back-off
-tests/           detector tests on synthetic signals
+tests/           detectors, estimator, contact localisation, teleop + motion model
 ```
 
 Tests: `env -u PYTHONPATH python -m pytest -q tests`. The `-u PYTHONPATH` keeps the
@@ -129,12 +145,14 @@ ROS install's pytest plugins out.
 
 ## Status
 
-- Verified so far:
+- Verified:
   - all unit tests
   - every script end to end on `--fake`, with a window and headless
-  - the touch GUI, including the teleop record → fit → detect-while-moving loop on the
-    simulated arm
-- Not run on the real arm yet. Check these first:
-  1. Mirror check and push-direction check (USAGE.md §2 A/B).
-  2. Is `Present_Current` signed? Look at `cur_raw_*` in the CSV.
-  3. Achieved loop Hz. It's shown in the window.
+  - on the real follower (2026-10-15): mirror check (wrist_roll offset +1024 ticks),
+    loop rate ~320 Hz in hold mode / ~240 Hz in teleop, P_Coefficient 16, gripper
+    Torque_Limit 500, Present_Current unsigned and only 1–7 raw units (unused)
+  - the 2026-10-15 real recordings replayed through the new estimator: time spent in
+    TOUCH dropped from 81 % to 32 % (hold session with real pushes) and 41 % to 14 %
+    (teleop session)
+- Not yet on the real arm: the surface localiser, `--soft`, the poke test (USAGE.md §2C).
+  The gear friction (`FRICTION_NM`) is an estimate until then.

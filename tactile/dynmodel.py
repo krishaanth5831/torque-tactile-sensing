@@ -1,15 +1,15 @@
-"""Expected load while the arm MOVES (teleop), so touch can be detected during motion.
+"""Expected position error while the arm MOVES (teleop), so touch can be detected during motion.
 
-Per joint j, fitted by least squares on a no-touch recording:
+The touch signal is err = goal - pos (see config.NM_PER_TICK_P16). Per joint j, fitted by
+least squares on a no-touch recording:
 
-    load_j ~= a_j * gravity_j(q) + b_j * qd_j + c_j * tanh(qd_j / v0) + d_j * qdd_j + e_j
+    err_j ~= a_j * gravity_j(q) + b_j * qd_j + c_j * tanh(qd_j / v0) + d_j * qdd_j + e_j
               (gravity from MuJoCo) (viscous)   (Coulomb friction)     (inertia)   (offset)
 
 IMPORTANT: every input comes from the COMMANDED trajectory (the goals we send:
 leader-mapped positions and their derivatives), never from the follower's measured
-position error or velocity. On a P servo, load ~= P * err holds whatever caused the
-error, including your hand. A model fed with err would "predict" the push and the
-residual would stay flat. The free a_j also absorbs sign/scale errors in the gravity model.
+position or velocity. Those contain your hand's push; a model fed with them would
+"predict" the push and the residual would stay flat. The free a_j also absorbs sign/scale errors in the gravity model.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from . import config
 from .model import SO101Model
 
 FEATURES = ["gravity", "qd", "coulomb", "qdd", "offset"]
+TARGET = "err"     # what the model predicts (older models predicted Present_Load)
 V0 = 30.0          # ticks/s: Coulomb friction smoothing
 
 
@@ -70,8 +71,8 @@ class LoadModel:
 
     # ------------------------------------------------------------------ fit / io
     @classmethod
-    def fit(cls, rows: list[dict], model: SO101Model, min_std: float = 4.0) -> "LoadModel":
-        """rows: dicts with t, goal{j}, load{j} (one per sample, in time order, one recording)."""
+    def fit(cls, rows: list[dict], model: SO101Model, min_std: float = 0.5) -> "LoadModel":
+        """rows: dicts with t, goal{j}, y{j} = err in ticks (one per sample, time order, one recording)."""
         X = {j: [] for j in config.JOINTS}
         Y = {j: [] for j in config.JOINTS}
         der = GoalDerivatives()
@@ -83,7 +84,7 @@ class LoadModel:
             f = features(model, r["goal"], der)
             for j in config.JOINTS:
                 X[j].append(f[j])
-                Y[j].append(r["load"][j])
+                Y[j].append(r["y"][j])
         coef, sigma, r2 = {}, {}, {}
         for j in config.JOINTS:
             A, y = np.array(X[j]), np.array(Y[j], float)
@@ -98,23 +99,23 @@ class LoadModel:
 
     def save(self, path: Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps({"features": FEATURES, "coef": {j: list(c) for j, c in self.coef.items()},
+        Path(path).write_text(json.dumps({"features": FEATURES, "target": TARGET, "coef": {j: list(c) for j, c in self.coef.items()},
                                           "sigma": self.sigma, "r2": self.r2}, indent=2))
 
     @classmethod
     def load(cls, path: Path) -> "LoadModel":
         d = json.loads(Path(path).read_text())
-        if d.get("features") != FEATURES:
-            raise ValueError(f"{path}: feature list differs from this code, re-run fit_model.py")
+        if d.get("features") != FEATURES or d.get("target") != TARGET:
+            raise ValueError(f"{path}: made by an older version (predicts load, not err): re-run fit_model.py")
         return cls(d["coef"], d["sigma"], d["r2"])
 
 
 def read_log(path: Path) -> list[dict]:
-    """A CsvLogger file -> rows with t, goal{j}, load{j}."""
+    """A CsvLogger file -> rows with t, goal{j}, y{j} = err (goal - pos, ticks)."""
     out = []
     with open(path) as f:
         for r in csv.DictReader(f):
             g = {j: (float(r[f"goal_{j}"]) if r[f"goal_{j}"] != "" else None) for j in config.JOINTS}
-            ld = {j: float(r[f"load_{j}"]) for j in config.JOINTS}
-            out.append({"t": float(r["t"]), "goal": g, "load": ld})
+            y = {j: (g[j] - float(r[f"pos_{j}"]) if g[j] is not None else 0.0) for j in config.JOINTS}
+            out.append({"t": float(r["t"]), "goal": g, "y": y})
     return out
