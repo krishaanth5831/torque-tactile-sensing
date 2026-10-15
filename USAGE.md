@@ -243,5 +243,5 @@ The real arm's friction is not measured yet; the poke test (§2C) gives the real
 | `SERVO STATUS ERROR` banner | overload / heat / voltage protection tripped; the servo goes soft. Lower `--torque-limit`, let it cool |
 | window frozen, terminal still logging | the window isn't being drawn (hidden / other workspace / screen locked). Bring it to front; Ctrl+C works either way |
 | Wayland `GLFWError: window position` warning | cosmetic, the window still opens |
-| `Failed to sync read ... no status packet` at start | the bus didn't answer the first read: run it again |
+| `Failed to sync read ... no status packet` / `Incorrect status packet` | another program is using the arm (`~/teleop.sh` / `lerobot-teleoperate`, another touch_gui): close it. Otherwise just run it again |
 | low Hz in the banner | each register read is a bus round trip; touch_gui reads 3 per tick + Status every 10th |

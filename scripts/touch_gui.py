@@ -375,6 +375,10 @@ finally:
         print(f"\nNext: python scripts/fit_model.py {log.path}")
 if worker_error:
     print(f"[tactile] the sensing loop crashed: {worker_error[0]!r} (traceback above)", file=sys.stderr)
+    if "status packet" in str(worker_error[0]):
+        print("[tactile] The follower's bus did not answer properly. Most likely another program is using it\n"
+              "          (lerobot-teleoperate / ~/teleop.sh, another touch_gui): close it and run again.\n"
+              "          Otherwise check the 12 V PSU and the USB cable, and just run it again.", file=sys.stderr)
 # Everything that matters is closed above (CSV, servo P gain + torque limit, ports). Exit
 # NOW: a viewer thread stuck inside MuJoCo's C++ (window not being drawn) would otherwise
 # hang interpreter shutdown, and glfw's atexit hook can segfault on a live render thread.

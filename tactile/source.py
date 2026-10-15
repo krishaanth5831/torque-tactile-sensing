@@ -100,7 +100,7 @@ class ArmSource(_Base):
         self._p: dict[str, int] = {}
 
     def _r(self, reg: str) -> dict[str, int]:
-        return self.bus.sync_read(reg, self.joints, normalize=False, num_retry=1)
+        return self.bus.sync_read(reg, self.joints, normalize=False, num_retry=3)
 
     def read(self) -> Sample:
         s = Sample(t=time.perf_counter() - self.t0)
