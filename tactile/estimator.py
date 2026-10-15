@@ -69,28 +69,39 @@ class TouchEstimator:
         else:
             self._still_since = None
             self._learn_until = None
-            if self.base is not None and self.base.ready:
-                self.base = None                    # new pose after moving: old baseline invalid
+            self.base = None      # new pose after moving: old (or half-learned) baseline invalid
 
         expected, sigma = None, None
+        model_exp = model_sig = None
+        if self.lm is not None:
+            p = self.lm.predict(features(self.model, goal, self.der))
+            model_exp = np.array([p[j] for j in J])
+            model_sig = np.array([self.lm.sigma[j] for j in J])
         if still and self._still_since is not None and t - self._still_since >= self.still_s:
             if self.base is None:
                 self.base = Baseline()
                 self._learn_until = t + self.learn_s
             if not self.base.ready:
-                self.base.add(x)
                 o.state = "LEARNING"
-                if t >= self._learn_until:
+                # With a model we are never blind: keep detecting with it while learning,
+                # and restart learning if it sees a touch (don't learn a push as "normal").
+                if model_exp is not None:
+                    expected, sigma = model_exp, model_sig
+                    if (np.abs((x - model_exp) / model_sig) > self.z_on).any():
+                        self.base = Baseline()
+                        self._learn_until = t + self.learn_s
+                    else:
+                        self.base.add(x)
+                else:
+                    self.base.add(x)
+                if self.base._buf and t >= self._learn_until:
                     self.base.freeze()
             else:
                 expected, sigma = self.base.mean, self.base.std
                 o.state = "WATCHING"
-        elif not still and self.lm is not None:
-            f = features(self.model, goal, self.der)
-            p = self.lm.predict(f)
-            expected = np.array([p[j] for j in J])
-            sigma = np.array([self.lm.sigma[j] for j in J])
-            o.state = "MOVING"
+        elif model_exp is not None:
+            expected, sigma = model_exp, model_sig
+            o.state = "MOVING" if not still else "settling (model)"
         else:
             o.state = "MOVING (no model: run fit_model.py)" if not still else "settling"
 

@@ -74,7 +74,18 @@ stop = threading.Event()
 relearn = threading.Event()
 
 
+worker_error = []
+
+
 def worker():
+    try:
+        _worker()
+    except BaseException as e:     # surfaced after the window closes; never die silently
+        worker_error.append(e)
+        raise
+
+
+def _worker():
     if not args.limp:
         src.hold_here(J, args.torque_limit)
     rate = RateMeter()
@@ -233,5 +244,7 @@ finally:
     if leader:
         leader.close()
     src.close(release=args.release_on_exit)
-    if args.record:
+    if args.record and not worker_error:
         print(f"\nNext: python scripts/fit_model.py {log.path}")
+if worker_error:
+    raise SystemExit(f"[tactile] the sensing loop crashed: {worker_error[0]!r} (traceback above)")

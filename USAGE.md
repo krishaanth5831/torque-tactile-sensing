@@ -157,9 +157,11 @@ periods always switch back to the sharper static baseline automatically.
   isn't enough to pin down a 3D force. The GUI then shows an **orange** arrow with a halo
   at the link middle, and the force shown is the *smallest* force that explains the
   torques (a lower bound).
-- **On the fake arm** this was measured over 87 random pushes: 82 detected, link exactly
-  right 63×, one link toward the base 17×, direction cos ≈ 0.99 where the point is
-  constrained. The fake uses the same model, so this proves the pipeline is consistent,
+- **On the fake arm**, measured with random 1–3 N pushes:
+  - **holding:** 82 of 87 detected; link exactly right 62×, one link toward the base 18×;
+    direction cos ≈ 0.99 where the point is constrained
+  - **teleop with a fitted model:** 14 of 18 detected while moving and pausing
+    (without the model, only the pushes during a pause are caught) The fake uses the same model, so this proves the pipeline is consistent,
   not that the real arm's signs are right. That's what checks A and B are for.
 
 ---
