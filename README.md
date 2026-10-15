@@ -4,9 +4,32 @@ Touch for the SO-101 **without adding sensors**: read what the STS3215 servos al
 report (load, current, position error) and turn it into "someone is pushing me" and
 "I am squeezing a tomato this hard".
 
-Ideas, physics and the full plan are in **[IDEAS.md](IDEAS.md)**.
+- **[USAGE.md](USAGE.md)**: every command. Covers testing without the arm, the real arm
+  on its own, using it during teleoperation, and the one-time checks.
+- **[IDEAS.md](IDEAS.md)**: the physics, the idea ladder, and what's next.
 
-## Run it (watch first)
+Current focus: a sense of touch for the arm (where am I pushed, which way, how hard).
+The tomato / grip-force work is parked for now (`squeeze.py` still works).
+
+## The touch GUI
+
+```bash
+conda activate lerobot
+python scripts/touch_gui.py --fake               # no arm needed: simulated pushes
+python scripts/touch_gui.py                      # real follower holds still: push it
+python scripts/touch_gui.py --teleop             # leader drives it (replaces lerobot-teleoperate)
+```
+
+A MuJoCo window shows the SO-101 mirroring the real arm:
+- arrows on each joint axis for the torque it feels
+- the touched link in red
+- an arrow for where the push is and which way it goes (orange = only the link is
+  certain)
+- in `--fake`, the true push in cyan
+
+See USAGE.md §2–3.
+
+## Older step-by-step tools (watch first)
 
 Everything runs in the `lerobot` conda env. Every script opens a live window and
 works with `--fake` (a simulated arm) so you can try it without the arm plugged in.
@@ -80,13 +103,20 @@ window, and `--duration N` stops after N seconds.
 ## Layout
 
 ```
+assets/so101/    MuJoCo SO-101 model (Menagerie, Apache-2.0, see SOURCE.md)
 tactile/
-  config.py      ports, joint ids, calibration ranges, GRIPPER_CLOSED_END
-  source.py      ArmSource (real bus, raw units) + FakeSource (P-servo sim), same interface
+  config.py      ports, joint ids, ranges, raw<->model signs/offsets, load->N.m, FORCE_SIGN
+  source.py      ArmSource (real bus, raw units) + FakeSource (P-servo sim, optional 3D pushes)
+  model.py       MuJoCo model: raw->angles, gravity, contact localisation (tau = J^T F)
+  estimator.py   TouchEstimator: LEARNING / WATCHING / MOVING / TOUCH, z-scores, contact
+  dynmodel.py    expected load while moving, from COMMANDED motion only (fit_model.py)
+  teleop.py      leader -> follower teleop in our own loop (ramp, step cap, clamp)
   detect.py      Baseline, PhaseBaseline, Hysteresis, analyse_squeeze (pure numpy, tested)
   liveplot.py    threaded matplotlib window (the bus loop never waits for drawing)
   logger.py      one new timestamped CSV per run
 scripts/
+  touch_gui.py   the 3D touch GUI: hold / teleop / record, --fake
+  fit_model.py   fit the moving-arm load model from a no-touch recording
   live_view.py   step 0, look at signals (optionally hold joints)
   push_detect.py step 1, hold / wiggle push detection, stop / comply reactions
   probe_gripper.py  which raw end of the gripper is closed
@@ -99,9 +129,12 @@ ROS install's pytest plugins out.
 
 ## Status
 
-- Verified so far: detector unit tests, plus every script end to end on `--fake`, with a
-  window and headless.
+- Verified so far:
+  - all unit tests
+  - every script end to end on `--fake`, with a window and headless
+  - the touch GUI, including the teleop record → fit → detect-while-moving loop on the
+    simulated arm
 - Not run on the real arm yet. Check these first:
-  1. Is `Present_Current` signed? Look at `cur_raw_*` in the CSV.
-  2. Achieved loop Hz. It's shown in the banner.
-  3. The gripper closed end, from `probe_gripper.py`.
+  1. Mirror check and push-direction check (USAGE.md §2 A/B).
+  2. Is `Present_Current` signed? Look at `cur_raw_*` in the CSV.
+  3. Achieved loop Hz. It's shown in the window.

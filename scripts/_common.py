@@ -21,8 +21,8 @@ def base_parser(desc: str) -> argparse.ArgumentParser:
     return p
 
 
-def open_and_report(args, full: bool = True, pushes: bool = True):
-    src = open_source(fake=args.fake, port=args.port, full=full, pushes=pushes)
+def open_and_report(args, full: bool = True, pushes: bool = True, cartesian: bool = False):
+    src = open_source(fake=args.fake, port=args.port, full=full, pushes=pushes, cartesian=cartesian)
     print(f"[tactile] source: {'FAKE' if args.fake else args.port}")
     try:
         rep = src.safety_report()

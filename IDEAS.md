@@ -53,10 +53,13 @@ differ only in how they predict "expected".
 - *Physics*: compute gravity torque per joint from the SO-101 URDF masses with MuJoCo
   `mj_inverse` (the Vinea sim already loads the arm), then fit one scale and offset per
   joint, because load units are not N·m.
-- *Data*: record ~10 min of slow random motion with nobody touching it. Fit, per joint,
-  `load ≈ a·sin q + b·cos q + c·q̇ + d·sign(q̇) + e·q̈` by least squares. That is classic
-  robot identification. A small MLP on (q, q̇, err) is the lazy upgrade. Then residual =
-  measured − predicted, thresholded with the same `Hysteresis`.
+- *Data*: record no-touch motion and fit, per joint,
+  `load ≈ a·gravity(q) + b·q̇ + c·sign(q̇) + d·q̈ + e` by least squares. **built**:
+  `touch_gui.py --record` then `fit_model.py`, with gravity from MuJoCo. Inputs must
+  come from the **commanded** motion only. On a P servo, load ≈ P × err whatever caused
+  the error, including a hand, so a model fed with err (or measured velocity) would
+  predict the push and the residual would stay flat. A small MLP on the same commanded
+  inputs is the possible upgrade.
 
 **Reactions** (what to do once touch is detected):
 - **built** `--react stop`: pause the motion. This is the collision stop, and it matters
@@ -66,13 +69,18 @@ differ only in how they predict "expected".
 - **next** admittance: `goal += K × residual` each tick, a smooth version of comply.
 - **later** kinesthetic teaching: record demonstrations by pushing the follower directly,
   with no leader arm. That's a cheaper way to collect LeRobot data.
-- **later** where is the force? The pattern of residuals across joints is τ = Jᵀ F.
-  Assume the contact is at the gripper and solve F = (Jᵀ)⁺ τ for the force direction
-  ("the truss is pushing me left").
+- **built** where is the force? `touch_gui.py`. The most distal loaded joint picks the
+  link, then a least-squares fit of τ = Jᵀ F over points on it gives the point and
+  direction. It's honest about the 1–3-joint links, where only the link is certain.
+- **next** a calibrated force scale (kitchen scale), so the ~N become real N.
+- **later** a tactile "map" on the model: accumulate where it gets touched over a
+  session (a heat map on the links).
 
 ---
 
-## 3. The tomato: grip without crushing (the gripper level)
+## 3. The tomato: grip without crushing (the gripper level). PARKED for now
+
+The focus is the arm's sense of touch first (§2). Everything below still stands for later.
 
 The window you want: **enough force that it doesn't slip out, less than what bruises it.**
 For a light fruit the "don't drop it" force is small, so the window is probably wide.
