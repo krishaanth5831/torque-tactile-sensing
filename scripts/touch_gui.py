@@ -231,13 +231,16 @@ try:
                     draw(viewer, pos, o, truth, hz, status)
                 viewer.sync()
             time.sleep(1 / 40)
+except KeyboardInterrupt:
+    print("\n[tactile] Ctrl+C: closing")
+finally:
     # Leaving the `with` only ASKS the viewer to close. Its render thread is a daemon
     # with no handle; if Python's atexit glfw.terminate() runs while it still renders,
     # the process segfaults. Wait for it (MuJoCo 3.8.1, names it "..._launch_internal").
+    # In `finally` so Ctrl+C waits too: skipping this made Ctrl+C segfault / hang.
     for t in threading.enumerate():
         if "_launch_internal" in t.name:
             t.join(timeout=5)
-finally:
     stop.set()
     th.join(timeout=3)
     log.close()

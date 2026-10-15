@@ -47,7 +47,9 @@ LEADER_CALIBRATION_JSON = (
 # model must follow). If a joint moves the wrong way, flip its sign. If it is off by a
 # constant angle, set its offset in ticks.
 JOINT_SIGN = {"shoulder_pan": 1, "shoulder_lift": 1, "elbow_flex": 1, "wrist_flex": 1, "wrist_roll": 1}
-JOINT_OFFSET_TICKS = {"shoulder_pan": 0, "shoulder_lift": 0, "elbow_flex": 0, "wrist_flex": 0, "wrist_roll": 0}
+# wrist_roll +1024 (90 deg): mirror check 2026-10-15, its EEPROM zero was moved on 2026-09-20.
+# +offset turns the model wrist clockwise seen from the arm looking out (axis is -x).
+JOINT_OFFSET_TICKS = {"shoulder_pan": 0, "shoulder_lift": 0, "elbow_flex": 0, "wrist_flex": 0, "wrist_roll": 1024}
 # The gripper's model range is not symmetric (-0.17..1.75 rad), so it is mapped linearly
 # from the calibrated raw range. Flip if the model jaw opens when the real one closes.
 GRIPPER_MODEL_FLIP = False
