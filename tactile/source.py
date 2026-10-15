@@ -70,7 +70,7 @@ class _Base:
 
     def clamp(self, joint: str, raw: float) -> int:
         lo, hi = self.ranges[joint]
-        return int(min(max(raw, lo), hi))
+        return int(round(min(max(raw, lo), hi)))
 
     def _fill_err(self, s: Sample) -> Sample:
         for j in self.joints:
@@ -80,7 +80,7 @@ class _Base:
         return s
 
 
-def soft_problems(pos: dict, goals: dict, ranges: dict, joints: list[str], margin: int = 25,
+def soft_problems(pos: dict, goals: dict, ranges: dict, joints: list[str], margin: int = config.STOP_MARGIN_TICKS,
                   max_err: int = 20) -> list[str]:
     """Why softening the servos would be unsafe right now ([] = fine).
 

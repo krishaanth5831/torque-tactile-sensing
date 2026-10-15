@@ -86,12 +86,29 @@ differ only in how they predict "expected".
   ~4 cm. The 1–3-joint links stay ambiguous by physics, and the cloud shows it.
 - **built** `--poke`: double-click a spot on the model, poke it on the arm, cm error per
   poke. The real accuracy number.
-- **next** beat friction with **dither**: a small fast goal oscillation (±2–4 ticks at
-  ~20 Hz) keeps every joint moving, so static friction averages out of the 0.1 s window
-  instead of hiding light pushes and leaving offsets after release. Costs a faint hum.
-  Try it in `sim.py` first (it already models friction).
-- **next** fit per-joint torque gains (and `FRICTION_NM`) from poke-test data: the points
-  are known, so the gains that minimise the poke error can be solved for.
+- **built (sim only)** beat friction with **dither**: `touch_gui.py --dither 4` shakes every
+  goal ±4 ticks at 8 Hz (triangle, joints out of step) and senses against the unshaken goal
+  over two periods. On the simulation calibrated to the real arm it removes every stuck
+  touch, ends touches 0.18 s after release (0.7 s without) and detects 83 % instead of
+  73 % of pushes at P=16. Costs a faint hum. **Next: try
+  it on the real arm** — the unknown is whether the STS3215 follows an 8 Hz ±4-tick goal
+  (its own acceleration limits); try 4–6 Hz if not.
+- **built** friction-aware estimator, from the real 2026-10-15 recordings: the readings sit
+  on one integer for seconds, gear friction is ~0.05 N·m per joint and parks joints up to
+  ~2 ticks off after every poke. The baseline now follows parked offsets while nothing
+  touches, a touch ends once every joint is dead still within two rest bands, and the
+  spring-back after such a re-zero is not a new touch. Real recordings: time in TOUCH
+  81 → 12 %, 36 → 3 %, no more 15–40 s stuck touches. (Simulation: stuck touches 20/40 →
+  1/30, right link 55 → 73 %.)
+- **built** a finger-sized force prior (log-normal around 3 N; "smallest force wins" put
+  shoulder pokes on the gripper) and one-sided evidence from joints resting on end stops.
+- **built** working without the arm: `replay_eval.py` scores the current code on any
+  recorded run, `touch_gui.py --replay` shows it in 3D, poke runs log their targets in
+  every row, and `sim.py` is calibrated to the real arm (encoder flicker ~5 %, 0.05 N·m).
+- **next** fit per-joint torque gains (and `FRICTION_NM`) from a clean poke-test run (targets
+  now logged per row): the points are known, so the gains that minimise the poke error
+  can be solved for. `self_calibrate.py` (sim-tested, ±1.5 % moves) measures each joint's
+  friction band directly once the arm may move.
 - **next** active touch for the proximal links: when a touch is ambiguous, wiggle the
   wrist/elbow a few ticks while the finger stays. New poses give new Jacobians, which
   pin the point down on the upper arm too.
@@ -198,7 +215,8 @@ contact into a force reading, so it acts as a spring scale.
 - [ ] block read of 56–70 (speed)
 - [x] `fit_model.py`: L2 gravity + friction regression from free-motion CSVs (now on err)
 - [x] surface contact localisation + poke test + realistic sim benchmark
-- [ ] dither mode (§2), per-joint gains from poke data, active touch
+- [x] dither mode (§2, sim-validated), replay tools, friction-aware estimator
+- [ ] dither on the real arm, per-joint gains from clean poke data, active touch
 - [ ] `calibrate_grams.py` + a `calibration.json` mapping units to grams
 - [ ] lift/slip/weight-check script (§3E)
 - [ ] lerobot robot subclass exposing load/current as observations (§4)

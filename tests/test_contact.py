@@ -122,3 +122,17 @@ def test_evidence_accumulates(setup):
         _, _, tau = _push(model, truth, i, rng)
         spreads.append(loc.update(POSE, tau, SIGMA).spread_cm)
     assert spreads[-1] <= spreads[0] + 1e-6
+
+
+def test_shoulder_pokes_stay_proximal_with_the_finger_prior(setup):
+    """A 2 N poke on the shoulder only turns shoulder_pan. The smallest force that explains
+    that is a tiny one far out on the gripper; a finger poke is not 0.2 N, so the prior must
+    keep the estimate on the shoulder / upper arm (the 2026-10-15 real poke failure)."""
+    model, loc, truth = setup
+    rng = np.random.default_rng(6)
+    idx = [i for i in range(truth.n) if truth.link_of_body[int(truth.body[i])] == "shoulder"]
+    near = []
+    for i in rng.choice(idx, 20, replace=False):
+        _, _, tau = _push(model, truth, i, rng, f=2.0)
+        near.append(_run(loc, tau).link in ("shoulder", "upper_arm"))
+    assert np.mean(near) > 0.9, np.mean(near)          # the old min-force prior: 85 %

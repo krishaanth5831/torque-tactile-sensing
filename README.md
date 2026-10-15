@@ -16,11 +16,10 @@ The tomato / grip-force work is parked for now (`squeeze.py` still works).
 ```bash
 conda activate lerobot
 python scripts/touch_gui.py --fake               # no arm needed: simulated finger pushes
-python scripts/touch_gui.py                      # real follower holds still: touch it
-python scripts/touch_gui.py --soft 4             # softer servos: finer touch
-python scripts/touch_gui.py --poke               # measure the real accuracy, in cm
-python scripts/touch_gui.py --teleop --soft 4 --poke   # pose with the leader, then poke: best signal
+python scripts/touch_gui.py --dither 4           # real follower holds still: touch it
+python scripts/touch_gui.py --teleop --dither 4 --poke   # pose with the leader, then measure accuracy
 python scripts/touch_gui.py --teleop             # leader drives it (replaces lerobot-teleoperate)
+python scripts/touch_gui.py --replay data/poke_<stamp>.csv   # a recorded run, re-analysed in 3D
 ```
 
 A MuJoCo window shows the SO-101 mirroring the real arm:
@@ -32,11 +31,18 @@ A MuJoCo window shows the SO-101 mirroring the real arm:
   `+-cm` and `~N` on top
 - in `--fake`, the true push in cyan and the error in cm
 
-How: each servo's position error is a torque sensor (it is a P controller), averaged
-below one tick. Every point of the real link surfaces is scored by how well a push-only
-fingertip force there explains all six joint torques (`τ = Jᵀ F`). On the simulated arm
-that finds the gripper to ~1 cm, the wrist to ~2–3 cm, forearm and upper arm to ~4 cm
-(`scripts/bench_touch.py`). The real-arm number comes from the poke test.
+How: each servo's position error is a torque sensor (it is a P controller). Every point of
+the real link surfaces is scored by how well a push-only, finger-sized force there explains
+all six joint torques (`τ = Jᵀ F`). The real limit is gear friction (~0.05 N·m per joint,
+measured from recordings): it hides light pokes and parks joints off after every poke.
+The estimator now undoes that parking, and `--dither` (goals shaking ±4 ticks) makes the
+friction average out. On a simulation calibrated to the real arm: ~75 % right link,
+3.5–4 cm median error, no stuck touches (`scripts/bench_touch.py`, USAGE.md §4). The real-arm
+number comes from a poke test.
+
+**Improving it without the arm:** `scripts/replay_eval.py` replays any recorded run
+through the current code (time in TOUCH, touches, poke error per poke), and
+`touch_gui.py --replay` shows it in 3D. Poke runs log their targets in every row.
 
 ## Older step-by-step tools (watch first)
 
@@ -120,7 +126,10 @@ tactile/
   config.py      ports, joint ids, ranges, raw<->model signs/offsets, err->N.m (K per P gain),
                  rest band (dead zone + friction), touchable bodies
   source.py      ArmSource (real bus, raw units, --soft P gain with re-aim) + FakeSource (2D scripts)
-  sim.py         ServoArmSim / SimArmSource: realistic simulated follower + fingertip pushes
+  sim.py         ServoArmSim / SimArmSource: simulated follower calibrated to the real one
+                 (encoder flicker, 0.05 N.m friction, dead zone) + fingertip pushes
+  replay.py      ReplaySource: a recorded CSV played back as if it were the arm
+  envelope.py    SafetyEnvelope: hard +-1.5 % / abort 1.8 % motion limit for self_calibrate
   surface.py     touchable surface points + normals, sampled from the link meshes
   contact.py     ContactLocalizer: push-only force fit at every surface point -> probability
   model.py       MuJoCo model: raw->angles, gravity, Jacobians, servo<->model torque
@@ -133,6 +142,8 @@ tactile/
 scripts/
   touch_gui.py   the 3D touch GUI: hold / soft / poke / teleop / record, --fake
   bench_touch.py localisation accuracy per link on the simulated arm (no window)
+  replay_eval.py the current code on a recorded run: TOUCH time, touches, poke cm error
+  self_calibrate.py  per-joint jitter + friction band from tiny moves (sim-tested only)
   fit_model.py   fit the moving-arm err model from a no-touch recording
   live_view.py   step 0, look at signals (optionally hold joints)
   push_detect.py step 1, hold / wiggle push detection, stop / comply reactions
@@ -149,13 +160,17 @@ ROS install's pytest plugins out.
 - Verified:
   - all unit tests
   - every script end to end on `--fake`, with a window and headless
-  - on the real follower (2026-10-15): mirror check,
-    loop rate ~320 Hz in hold mode / ~240 Hz in teleop, P_Coefficient 16, gripper
-    Torque_Limit 500, Present_Current unsigned and only 1–7 raw units (unused)
-  - the 2026-10-15 real recordings replayed through the new estimator: time spent in
-    TOUCH dropped from 81 % to 32 % (hold session with real pushes) and 41 % to 14 %
-    (teleop session)
-- First real poke test (2026-10-15, P=16, elbow resting on its end stop): median 12 cm,
-  link right 27 %. Light pokes moved each joint only 1–3 ticks: too little signal at P=16.
-  Next: the poke test with `--teleop --soft 4` in a free pose. `--soft` is untested on the arm.
-  The gear friction (`FRICTION_NM`) is an estimate until then.
+  - on the real follower (2026-10-15): mirror check, loop rate ~320 Hz in hold mode /
+    ~240 Hz in teleop, P_Coefficient 16, gripper Torque_Limit 500, Present_Current
+    unsigned and only 1–7 raw units (unused)
+  - from the real recordings: readings sit on one integer for seconds (~5 % flicker),
+    static gear friction ~0.05 N·m per joint, light pokes move a joint only 1–4 ticks.
+    The simulation is calibrated to these numbers.
+  - the real recordings replayed through the current code: time in TOUCH 81 % → 12 %
+    (rest-pose hold), 49 % → 28 % (hold), 36 % → 3 % (poke run), with the same number of
+    real touches and no 15–40 s stuck ones
+- First real poke test (2026-10-15, P=16, elbow and gripper resting on their stops):
+  median 12 cm, link right 27 %. Its targets had to be paired with touches by order and
+  the old estimator's stuck touches got some of them, so it can't score the new code
+  reliably (5–8 cm on replay). Poke runs now log their targets per row.
+- Not yet on the real arm: `--dither`, `--soft`, `self_calibrate.py`, a clean poke test.
