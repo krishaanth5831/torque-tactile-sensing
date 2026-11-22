@@ -1,15 +1,16 @@
 # Usage: every command, in order
 
-Everything runs from the repo root in the `lerobot` conda env:
+Everything runs from the repo root in your LeRobot Python env (setup: [README](README.md#setup)):
 
 ```bash
-conda activate lerobot
-cd ~/Desktop/personal_projects/github/vinea-so101/torque-tactile-sensing
+conda activate lerobot        # or whatever your LeRobot env is called
+cd torque-tactile-sensing
 ```
 
-Every script opens a window. Every script has `--fake` (a simulated arm, no hardware
-needed) and `--duration N` (stop after N seconds). Every run writes a **new**
-`data/<script>_<timestamp>.csv`; nothing is ever appended or overwritten.
+Every script that talks to the arm opens a window and has `--fake` (a simulated arm, no
+hardware needed) and `--duration N` (stop after N seconds). Every such run writes a **new**
+`data/<script>_<timestamp>.csv`; nothing is ever appended or overwritten. The analysis
+scripts (`bench_touch.py`, `replay_eval.py`) print numbers only.
 
 ---
 
@@ -36,7 +37,8 @@ python scripts/touch_gui.py --replay data/poke_<stamp>.csv --replay-speed 2
 python scripts/replay_eval.py data/poke_<stamp>.csv              # add --variants to compare settings
 
 # Accuracy on the simulated arm, per link (no window; 2 earlier pokes leave friction offsets)
-systemd-run --user --scope -p MemoryMax=3G python scripts/bench_touch.py --p 16 --dither 0 4 --window 0.25
+python scripts/bench_touch.py --p 16 --dither 0 4 --window 0.25
+# under a memory cap: systemd-run --user --scope -p MemoryMax=3G python scripts/bench_touch.py ...
 
 # Plain signal plots and the simpler detectors from step 0/1
 python scripts/live_view.py --fake
@@ -50,8 +52,9 @@ env -u PYTHONPATH python -m pytest -q tests
 
 ## 2. The real arm on its own (follower holds still, you push it)
 
-Plug in the follower (white arm, 12 V PSU on). The leader is not needed. Close
-`lerobot-teleoperate` / `~/teleop.sh` first: only one program can use the follower's bus.
+Plug in the follower (12 V PSU on). The leader is not needed. Close
+`lerobot-teleoperate` (or any other program using the arm) first: only one program can use
+the follower's bus.
 
 **The arm must be in free space, not on an end stop.** If a joint rests on its stop (the
 folded rest pose does this for shoulder_lift, the elbow and the closed gripper), the stop
@@ -295,5 +298,71 @@ The real arm's accuracy needs a clean poke test (§2C).
 | `SERVO STATUS ERROR` banner | overload / heat / voltage protection tripped; the servo goes soft. Lower `--torque-limit`, let it cool |
 | window frozen, terminal still logging | the window isn't being drawn (hidden / other workspace / screen locked). Bring it to front; Ctrl+C works either way |
 | Wayland `GLFWError: window position` warning | cosmetic, the window still opens |
-| `Failed to sync read ... no status packet` / `Incorrect status packet` | another program is using the arm (`~/teleop.sh` / `lerobot-teleoperate`, another touch_gui): close it. Otherwise just run it again |
+| `Failed to sync read ... no status packet` / `Incorrect status packet` | another program is using the arm (`lerobot-teleoperate`, another touch_gui): close it. Otherwise just run it again |
 | low Hz in the banner | each register read is a bus round trip; touch_gui reads 3 per tick + Status every 10th (+1 goal write with `--dither`) |
+
+---
+
+## 7. Older step-by-step tools (watch first)
+
+The simpler tools from before the touch GUI. Every one opens a live matplotlib window and
+works with `--fake` (a simulated arm), so you can try it without the arm plugged in.
+
+```bash
+# 0. look at the raw signals. The fake arm gets random "hand pushes"
+python scripts/live_view.py --fake
+
+# 1. push detection: hold still, learn, then flag pushes (red banner)
+python scripts/push_detect.py --fake
+python scripts/push_detect.py --fake --mode wiggle --joint elbow_flex --react stop
+
+# 2. gripper squeeze: contact, stiffness, stop at target, back off on crush
+python scripts/squeeze.py --fake
+python scripts/squeeze.py --fake --torque-limit 600 --target 500 --max-lead 400   # fake tomato gets crushed
+```
+
+### On the real arm (follower, 12 V PSU on)
+
+The scripts only talk to the **follower** on its by-id port (`tactile/config.py`, or
+`--port`). Nothing can share the serial port with `lerobot-teleoperate`, so close teleop
+first.
+
+```bash
+# torque untouched, just watch (move the limp arm by hand)
+python scripts/live_view.py
+
+# hold the pose at 30 % torque, then push it with your hand
+python scripts/live_view.py --hold arm --torque-limit 300
+python scripts/push_detect.py --torque-limit 300                      # don't touch for the first 3 s
+python scripts/push_detect.py --signal err                            # try load / cur / err, compare
+python scripts/push_detect.py --mode wiggle --joint shoulder_pan --amp 150 --period 4 --react stop
+python scripts/push_detect.py --react comply                          # lead it around by hand
+
+# gripper: FIRST find which raw end is closed, write it into tactile/config.py
+python scripts/probe_gripper.py
+python scripts/squeeze.py --torque-limit 250 --target 150 --speed 80  # sponge / foam first!
+```
+
+`--no-window` logs without a window, and `--duration N` stops after N seconds.
+
+---
+
+## 8. Safety details
+
+- `--torque-limit` writes the servo's **Torque_Limit** (RAM, 0..1000 = 0..100 %). The
+  servo enforces it itself, so it is the real force ceiling. It is restored on exit and
+  resets on power-up anyway.
+- At startup each script prints `Torque_Limit`, `Max_Torque_Limit`, `Protection_Current`,
+  `Overload_Torque`, `P_Coefficient`, `Minimum_Startup_Force` and the dead zones. A bare
+  bus does not run lerobot's `configure()`, so lerobot's gripper caps (50 %) and P=16 are
+  only there if the EEPROM has them. Check the printout.
+- All goals are raw ticks clamped to `range_min/range_max` from the follower's LeRobot
+  calibration file (`CALIBRATION_JSON` in `tactile/config.py`). There is no lerobot
+  normalisation, so the `use_degrees` trap doesn't apply.
+- `touch_gui.py --soft P` writes `P_Coefficient` while torque is on (Lock=1, so RAM
+  only), re-aims the goals so the pose holds, and restores the original P on exit.
+  lerobot also rewrites P=16 every time it connects.
+- On exit torque stays **on** (the arm holds instead of dropping). `--release-on-exit`
+  makes it go limp, so support the arm.
+- A non-zero `Status` register (overload/heat/voltage trip) is shown in purple/red. A
+  tripped servo goes soft, which looks exactly like a slip or a crushed fruit.
