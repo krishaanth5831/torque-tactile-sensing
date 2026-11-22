@@ -43,7 +43,8 @@ rough sense of touch on the arm for free.
   `requirements.txt` or `pyproject.toml` yet.
 - For the real arm: an SO-101 follower (12 V servos, power supply on) calibrated with
   LeRobot. The leader is only needed for `--teleop`.
-- No hardware is needed for `--fake`, `--replay` or the tests.
+- No arm is needed for `--fake`, `--replay` or the tests (`--replay` and one test still
+  want the follower's calibration file, see setup step 4).
 
 ## Setup
 
@@ -207,8 +208,10 @@ data/            your recordings (gitignored)
 env -u PYTHONPATH python -m pytest -q tests
 ```
 
-The tests need no hardware. `env -u PYTHONPATH` keeps a ROS install's pytest plugins
-out; drop it if you have no ROS.
+The tests need no arm plugged in. `tests/test_replay.py` does read the follower's
+LeRobot calibration file (`CALIBRATION_JSON`, setup step 4), so without one it fails and
+the other tests pass. `env -u PYTHONPATH` keeps a ROS install's pytest plugins out; drop it
+if you have no ROS.
 
 ## Status
 
