@@ -1,7 +1,8 @@
 # Ideas: torque-based tactile sensing on the SO-101
 
-Status per idea: **built** = a script in this repo does it (tested on `--fake` only so
-far), **next** = worth doing soon, **later** = once the basics work.
+Status per idea: **built** = a script in this repo does it (tested on `--fake`; which
+parts have run on the real arm is in the README's Status), **next** = worth doing soon,
+**later** = once the basics work.
 
 ---
 
@@ -53,7 +54,7 @@ differ only in how they predict "expected".
 |---|---|---|---|
 | L0 hold | mean + noise learned for 3 s while still | arm holds a pose | **built**: `push_detect.py` |
 | L1 phase | expected signal at each point of a repeated motion | arm repeats a motion (wiggle, a fixed pick path) | **built**: `push_detect.py --mode wiggle` |
-| L2 model | gravity(q) + friction(q̇) + inertia(q̈) | any motion | **next** |
+| L2 model | gravity(q) + friction(q̇) + inertia(q̈) | any motion | **built** (data way, below): `fit_model.py`, not yet on the real arm |
 | L3 observer | momentum observer (De Luca), no q̈ needed | any motion, the "proper" cobot way | later |
 
 **L2, two ways:**
