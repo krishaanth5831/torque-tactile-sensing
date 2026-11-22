@@ -71,7 +71,7 @@ class LoadModel:
 
     # ------------------------------------------------------------------ fit / io
     @classmethod
-    def fit(cls, rows: list[dict], model: SO101Model, min_std: float = 0.5) -> "LoadModel":
+    def fit(cls, rows: list[dict], model: SO101Model, min_std: float = 0.5) -> LoadModel:
         """rows: dicts with t, goal{j}, y{j} = err in ticks (one per sample, time order, one recording)."""
         X = {j: [] for j in config.JOINTS}
         Y = {j: [] for j in config.JOINTS}
@@ -103,7 +103,7 @@ class LoadModel:
                                           "sigma": self.sigma, "r2": self.r2}, indent=2))
 
     @classmethod
-    def load(cls, path: Path) -> "LoadModel":
+    def load(cls, path: Path) -> LoadModel:
         d = json.loads(Path(path).read_text())
         if d.get("features") != FEATURES or d.get("target") != TARGET:
             raise ValueError(f"{path}: made by an older version (predicts load, not err): re-run fit_model.py")

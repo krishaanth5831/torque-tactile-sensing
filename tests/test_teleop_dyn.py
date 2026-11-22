@@ -1,6 +1,5 @@
 """Leader->follower mapping, step limiter, and the dynamic load model on fake-arm data."""
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
