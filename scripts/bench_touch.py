@@ -35,7 +35,14 @@ from tactile.sim import ServoArmSim  # noqa: E402
 
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 p.add_argument("--p", type=int, nargs="+", default=[16, 4])
-p.add_argument("--friction", type=float, nargs="+", default=[0.01, 0.02, 0.04], help="N.m per joint")
+p.add_argument("--friction", type=float, nargs="+", default=[0.05], help="N.m per joint (real arm ~0.05)")
+p.add_argument("--dither", type=float, nargs="+", default=[0.0],
+               help="goal dither amplitude(s), ticks (0 = off). The estimator sees the undithered goal")
+p.add_argument("--dither-hz", type=float, default=8.0)
+p.add_argument("--window", type=float, default=None, help="estimator averaging window, s (default: its own)")
+p.add_argument("--no-finger-prior", action="store_true", help="old behaviour: smallest force wins")
+p.add_argument("--pre-pushes", type=int, default=2,
+               help="unscored pushes before the scored one, like a real session (friction leaves joints parked)")
 p.add_argument("--trials", type=int, default=40)
 p.add_argument("--force", type=float, nargs=2, default=[1.0, 5.0], help="push force range, N")
 p.add_argument("--seed", type=int, default=0)
@@ -47,7 +54,7 @@ try:
 except FileNotFoundError:
     RANGES = {j: (900, 3100) for j in J}
 loc_model = SO101Model(ranges=RANGES)
-loc = ContactLocalizer(loc_model)
+loc = ContactLocalizer(loc_model, **({"finger_force_n": None, "force_reg_n": 10.0} if args.no_finger_prior else {}))
 est_model = SO101Model(ranges=RANGES)
 LINKS = loc.links
 READ_HZ, PHYS_HZ, LOC_HZ = 320, 1000, 25
@@ -63,42 +70,63 @@ def random_pose(rng):
     return pose
 
 
-def trial(p_gain, friction, seed):
+def tri(x):
+    """Triangle wave, period 2 pi, -1..1."""
+    return 2 / np.pi * np.arcsin(np.sin(x))
+
+
+PHASE = np.arange(len(J)) * 2 * np.pi / len(J)       # joints dither out of step
+
+
+def trial(p_gain, friction, dither, seed):
     rng = np.random.default_rng(seed)
     sim = ServoArmSim(RANGES, friction_nm=friction, p_gain=p_gain, seed=seed, pose=random_pose(rng))
-    sim.goal = np.round(sim.pos)
-    est = TouchEstimator(est_model, p_gain=p_gain, localizer=loc)
+    nominal = np.round(sim.pos)
+    sim.goal = nominal.copy()
+    kw = {"window_s": args.window} if args.window else {}
+    if dither:
+        kw["settle_release"] = False
+    est = TouchEstimator(est_model, p_gain=p_gain, localizer=loc, **kw)
     t, next_read, next_loc = 0.0, 0.0, 0.0
     fp = stuck = False
+    release_lag = None
     det = False
     c = None
-    end = T_PUSH + T_HOLD + 1.6
+    t_push = T_PUSH + 2.5 * args.pre_pushes                   # the scored push
+    starts = [T_PUSH + 2.5 * k for k in range(args.pre_pushes)] + [t_push]
+    end = t_push + T_HOLD + 1.6
     while t < end:
-        if sim.push is None and abs(t - T_PUSH) < 0.5 / PHYS_HZ:
-            sim.start_push(t, T_HOLD, force_n=tuple(args.force))
+        for k, ts in enumerate(starts):
+            if sim.push is None and abs(t - ts) < 0.5 / PHYS_HZ:
+                sim.start_push(t, T_HOLD if ts == t_push else 1.0, force_n=tuple(args.force))
         if sim.push is not None and t > sim.push[4]:
             sim.push = None
         sim.step(t, 1 / PHYS_HZ)
         t += 1 / PHYS_HZ
         if t >= next_read:
             next_read += 1 / READ_HZ
+            if dither:
+                sim.goal = np.round(nominal + dither * tri(2 * np.pi * args.dither_hz * t + PHASE))
             pos, _ = sim.measure()
-            goal = dict(zip(J, sim.goal))
+            goal = dict(zip(J, nominal))
             o = est.update(t, goal, dict(zip(J, pos)))
             if o.touching and t < T_PUSH:
                 fp = True
-            if T_PUSH < t < T_PUSH + T_HOLD:
+            if t_push < t < t_push + T_HOLD:
                 truth = sim.true_push
                 if o.touching:
                     det = True
                 if t >= next_loc and o.touching:
                     next_loc = t + 1 / LOC_HZ
                     c2 = est.localize()
-                    if c2 is not None and t < T_PUSH + T_HOLD - 0.15:
+                    if c2 is not None and t < t_push + T_HOLD - 0.15:
                         c, last_truth = c2, truth
-            if t > T_PUSH + T_HOLD + 1.4 and o.touching:
+            if t > t_push + T_HOLD + 1.4 and o.touching:
                 stuck = True
-    out = {"fp": fp, "stuck": stuck, "det": det, "link": sim.push_link}
+            if t > t_push + T_HOLD and release_lag is None and not o.touching:
+                release_lag = t - (t_push + T_HOLD)
+    out = {"fp": fp, "stuck": stuck, "det": det, "link": sim.push_link,
+           "lag": release_lag if release_lag is not None else 1.6}
     if c is not None:
         link, tp, tf = last_truth
         out.update(link=link, ok=c.link == link, err_cm=float(np.linalg.norm(c.point - tp) * 100),
@@ -108,19 +136,21 @@ def trial(p_gain, friction, seed):
 
 
 rows = []
-for P in args.p:
-    for fr in args.friction:
+for P, fr, dth in [(P, fr, dth) for P in args.p for fr in args.friction for dth in args.dither]:
+    if True:
         t0 = time.time()
-        res = [trial(P, fr, args.seed + i) for i in range(args.trials)]
+        res = [trial(P, fr, dth, args.seed + i) for i in range(args.trials)]
         by, pushed = defaultdict(list), defaultdict(list)
         for r in res:
             pushed[r["link"]].append(r["det"])
             if "err_cm" in r:
                 by[r["link"]].append(r)
         n_det = sum(r["det"] for r in res)
-        print(f"\n=== P={P}  friction={fr:.3f} N.m  ({args.trials} pushes, {time.time() - t0:.0f} s)  "
+        dtxt = f"dither +-{dth:g} ticks @ {args.dither_hz:g} Hz" if dth else "no dither"
+        print(f"\n=== P={P}  friction={fr:.3f} N.m  {dtxt}  ({args.trials} pushes, {time.time() - t0:.0f} s)  "
               f"detected {n_det}/{args.trials}   false touch before push: {sum(r['fp'] for r in res)}   "
-              f"stuck after push: {sum(r['stuck'] for r in res)}")
+              f"stuck after push: {sum(r['stuck'] for r in res)}   "
+              f"release lag median {np.median([r['lag'] for r in res if r['det']]):.2f} s")
         print(f"  {'link':22s} {'n':>3s} {'det':>5s} {'link ok':>8s} {'med cm':>7s} {'p80 cm':>7s} {'spread':>7s} {'dir cos':>8s}")
         for link in LINKS:
             rs = by.get(link, [])

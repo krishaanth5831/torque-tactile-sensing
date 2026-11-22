@@ -5,8 +5,11 @@ We measure tau (6 joints, with noise sigma) and ask, for EVERY candidate surface
 (surface.py, ~4600 points every 5 mm): what is the best force a finger could apply
 there, and how well does it explain the measurement?
 
-    min_F  sum_j ((J(p)^T F - tau)_j / sigma_j)^2  +  |F|^2 / FORCE_PRIOR^2
+    min_F  sum_j ((J(p)^T F - tau)_j / sigma_j)^2        (+ a tiny |F|^2 regulariser)
     s.t.   F pushes INTO the surface, within a friction cone around the inward normal
+
+and then weights each point by how plausible that force is for a finger (log-normal around
+config.FINGER_FORCE_N): a point that needs 0.2 N or 40 N is less likely than one that needs 3 N.
 
 The constraint is what makes this sharp. Without it, every point on the force's line of
 action explains tau equally well (where it enters the arm AND where it leaves). A
@@ -71,13 +74,14 @@ def _cone_project(F: np.ndarray, u: np.ndarray, cos_t: float, sin_t: float) -> n
 
 class ContactLocalizer:
     def __init__(self, model: SO101Model, surface: SurfaceMap | None = None, mu: float = config.FINGER_MU,
-                 force_prior_n: float = config.FORCE_PRIOR_N, temper: float = 0.3, iters: int = 60,
-                 n_heat: int = 120):
+                 finger_force_n: float | None = config.FINGER_FORCE_N, temper: float = 0.3, iters: int = 60,
+                 n_heat: int = 120, force_reg_n: float = config.FORCE_REG_N):
         self.model = model
         self.s = surface if surface is not None else build_surface(model.m)
         theta = np.arctan(mu)
         self.cos_t, self.sin_t = float(np.cos(theta)), float(np.sin(theta))
-        self.lam = 1.0 / force_prior_n ** 2
+        self.lam = 1.0 / force_reg_n ** 2
+        self.finger_force_n = finger_force_n          # None: no force-size prior
         self.temper, self.iters, self.n_heat = temper, iters, n_heat
         self.links = sorted(set(self.s.link_of_body.values()), key=list(self.s.link_of_body.values()).index)
         self._link_idx = np.array([self.links.index(self.s.link_of_body[int(b)]) for b in self.s.body])
@@ -107,17 +111,23 @@ class ContactLocalizer:
         cross = np.cross(r[:, :, None], Jw_p, axis=1)            # r x (each column)
         return Jv[self.s.body] - cross, P, Nrm
 
-    def update(self, raw_pos: dict, tau_tick: np.ndarray, sigma_tick: np.ndarray) -> Contact:
+    def update(self, raw_pos: dict, tau_tick: np.ndarray, sigma_tick: np.ndarray,
+               stop_dir: np.ndarray | None = None) -> Contact:
         """raw_pos: measured raw ticks. tau_tick / sigma_tick: external torque and its noise
-        per config.JOINTS, N.m in each servo's +tick direction."""
+        per config.JOINTS, N.m in each servo's +tick direction.
+        stop_dir: per joint, +1 / -1 if it rests on the stop at the top / bottom of its range,
+        else 0. Such a joint can't feel a push INTO its stop (the stop takes it), but a push
+        that would lift it OFF the stop (beyond the preload holding it there) would have
+        moved it: one-sided evidence instead of a reading."""
         self.model.set_pose(raw_pos)
         Jp, P, Nrm = self.point_jacobians()
         g_tick = self.model.torque_tick_to_model                  # (6,) model torque per tick torque
+        stop_dir = np.zeros(len(config.JOINTS)) if stop_dir is None else np.asarray(stop_dir, float)
         tau = np.zeros(self.model.m.nv)
         sig = np.ones(self.model.m.nv)
         for k in range(len(config.JOINTS)):
-            tau[self.model.dof[k]] = tau_tick[k] * g_tick[k]
-            sig[self.model.dof[k]] = sigma_tick[k] * abs(g_tick[k])
+            tau[self.model.dof[k]] = 0.0 if stop_dir[k] else tau_tick[k] * g_tick[k]
+            sig[self.model.dof[k]] = (10.0 if stop_dir[k] else sigma_tick[k]) * abs(g_tick[k])
         A = np.transpose(Jp, (0, 2, 1)) / sig[None, :, None]       # (N,nv,3)
         b = tau / sig
         H = np.einsum("nki,nkj->nij", A, A) + self.lam * np.eye(3)
@@ -133,8 +143,19 @@ class ContactLocalizer:
             F, tk = Fn, tn
         chi2 = np.einsum("ni,nij,nj->n", F, H, F) - 2 * np.einsum("ni,ni->n", g, F) + b @ b
         chi2 = np.maximum(chi2, 0.0)
+        for k in np.flatnonzero(stop_dir):
+            # torque this candidate's force would put on joint k, in its +tick direction
+            pred = np.einsum("ni,ni->n", Jp[:, :, self.model.dof[k]], F) / g_tick[k]
+            away = -stop_dir[k] * pred                       # > 0: pulls the joint off its stop
+            seen = max(-stop_dir[k] * tau_tick[k], 0.0)      # did it actually come off?
+            excess = np.maximum(away - config.STOP_PRELOAD_NM, 0.0)
+            chi2 = chi2 + ((excess - seen) / sigma_tick[k]) ** 2
+        loglik = -0.5 * chi2
+        if self.finger_force_n:
+            fmag = np.maximum(np.linalg.norm(F, axis=1), 0.05)
+            loglik -= 0.5 * (np.log(fmag / self.finger_force_n) / np.log(config.FINGER_FORCE_SPREAD)) ** 2
 
-        self.logp += (1.0 if self.updates == 0 else self.temper) * (-0.5 * chi2)
+        self.logp += (1.0 if self.updates == 0 else self.temper) * loglik
         self.updates += 1
         lp = self.logp - self.logp.max()
         w = np.exp(lp)

@@ -48,9 +48,7 @@ LEADER_CALIBRATION_JSON = (
 # model must follow). If a joint moves the wrong way, flip its sign. If it is off by a
 # constant angle, set its offset in ticks.
 JOINT_SIGN = {"shoulder_pan": 1, "shoulder_lift": 1, "elbow_flex": 1, "wrist_flex": 1, "wrist_roll": 1}
-# wrist_roll +1024 (90 deg): mirror check 2026-10-15, its EEPROM zero was moved on 2026-09-20.
-# +offset turns the model wrist clockwise seen from the arm looking out (axis is -x).
-JOINT_OFFSET_TICKS = {"shoulder_pan": 0, "shoulder_lift": 0, "elbow_flex": 0, "wrist_flex": 0, "wrist_roll": 1024}
+JOINT_OFFSET_TICKS = {"shoulder_pan": 0, "shoulder_lift": 0, "elbow_flex": 0, "wrist_flex": 0, "wrist_roll": 0}
 # The gripper's model range is not symmetric (-0.17..1.75 rad), so it is mapped linearly
 # from the calibrated raw range. Flip if the model jaw opens when the real one closes.
 GRIPPER_MODEL_FLIP = False
@@ -73,13 +71,17 @@ P_DEFAULT = 16                 # lerobot's position_p_coefficient for the follow
 # learned noise.
 TAU_FLOOR_NM = 0.004
 # THE REST BAND. After a push ends, a servo does not return exactly: inside its dead zone
-# (CW/CCW_Dead_Zone, 1 tick) it does not drive at all, and gear friction holds it until
-# the net torque exceeds FRICTION_NM. So it can settle anywhere within
-#     band = DEAD_ZONE_TICKS + FRICTION_NM / K   ticks   of where it started.
-# Offsets inside the band are "no touch"; only what exceeds it counts. In N.m the dead-zone
-# part is K * 1 tick: 4x smaller at --soft 4 than at P=16, the main gain of soft servos.
+# (CW/CCW_Dead_Zone, 1 tick) it does not drive at all, and outside it gear friction holds it
+# until the drive K * err beats FRICTION_NM. So it can settle anywhere within
+#     band = max(DEAD_ZONE_TICKS, FRICTION_NM / K)   ticks   of where it started
+# (measure it per joint with scripts/self_calibrate.py). Offsets inside the band are "no
+# touch"; only what exceeds it counts. In N.m the dead-zone part is K * 1 tick: 4x smaller
+# at --soft 4 than at P=16, the main gain of soft servos.
 DEAD_ZONE_TICKS = 1.0
-FRICTION_NM = 0.01             # ESTIMATE until measured on the arm (bench_touch.py sweeps it)
+# From the real 2026-10-15 recordings: after pokes, joints stayed parked up to ~2-3 ticks off
+# at P=16 for tens of seconds -> static friction ~0.05 N.m. scripts/self_calibrate.py
+# measures it per joint once the arm may move.
+FRICTION_NM = 0.05
 
 # ------------------------------------------------------------------ contact localisation
 # Bodies whose surface can be touched (the fixed base never moves a joint). camera_mount
@@ -88,7 +90,20 @@ TOUCH_BODIES = ["shoulder", "upper_arm", "lower_arm", "wrist", "gripper", "camer
                 "moving_jaw_so101_v1"]
 SURFACE_SPACING_M = 0.005      # one candidate point per 5 x 5 mm of surface
 FINGER_MU = 0.6                # friction cone: how far a push may lean from the surface normal
-FORCE_PRIOR_N = 10.0           # finger pushes are a few N: mild preference for small forces
+# How hard a finger pokes. The fit at each point gives the force needed THERE; points that
+# need an implausible force (0.2 N, or 40 N) are less likely. Without this, the smallest
+# force always won, which put shoulder pokes (1-2 N on a short lever) on the gripper (0.2 N
+# on a long one): seen in the 2026-10-15 poke test. Log-normal: typical 3 N, x/÷3 = 1 sigma.
+FINGER_FORCE_N = 3.0
+FINGER_FORCE_SPREAD = 3.0
+FORCE_REG_N = 30.0             # weak quadratic regulariser inside the fit (numerics only)
+
+# A joint closer than this to a calibrated range end is probably resting on its end stop:
+# the stop, not the motor, takes the push, so its reading is not used to locate a touch.
+STOP_MARGIN_TICKS = 25
+# What holds a joint on its stop (servo + gravity): a push away from the stop smaller than
+# this is absorbed too. A guess; it only sets how much "would have lifted it" is tolerated.
+STOP_PRELOAD_NM = 0.05
 
 
 def load_ranges(path: Path = CALIBRATION_JSON) -> dict[str, tuple[int, int]]:

@@ -70,7 +70,7 @@ class _Base:
 
     def clamp(self, joint: str, raw: float) -> int:
         lo, hi = self.ranges[joint]
-        return int(min(max(raw, lo), hi))
+        return int(round(min(max(raw, lo), hi)))
 
     def _fill_err(self, s: Sample) -> Sample:
         for j in self.joints:
@@ -78,6 +78,25 @@ class _Base:
             s.goal[j] = g
             s.err[j] = None if g is None else g - s.pos[j]
         return s
+
+
+def soft_problems(pos: dict, goals: dict, ranges: dict, joints: list[str], margin: int = config.STOP_MARGIN_TICKS,
+                  max_err: int = 20) -> list[str]:
+    """Why softening the servos would be unsafe right now ([] = fine).
+
+    The re-aim scales err by P_old/P_new, which keeps the torque only if err is gravity sag.
+    A joint resting on its end stop (goal clamped inside the range, err ~45) would get a
+    goal ~4x further away and drive there as soon as it is lifted off the stop. A joint on
+    its stop also can't feel anything: the stop takes the push."""
+    bad = []
+    for j in joints:
+        lo, hi = ranges[j]
+        far = goals.get(j) is not None and abs(goals[j] - pos[j]) > max_err
+        stop = j != "gripper" and (pos[j] < lo + margin or pos[j] > hi - margin)
+        if far or stop:
+            why = "on its end stop" if stop else f"{goals[j] - pos[j]:+.0f} ticks from its goal"
+            bad.append(f"{j} {why} (pos {pos[j]:.0f}, range {lo}-{hi})")
+    return bad
 
 
 # --------------------------------------------------------------------------- real arm
@@ -100,7 +119,7 @@ class ArmSource(_Base):
         self._p: dict[str, int] = {}
 
     def _r(self, reg: str) -> dict[str, int]:
-        return self.bus.sync_read(reg, self.joints, normalize=False, num_retry=1)
+        return self.bus.sync_read(reg, self.joints, normalize=False, num_retry=3)
 
     def read(self) -> Sample:
         s = Sample(t=time.perf_counter() - self.t0)
@@ -159,21 +178,13 @@ class ArmSource(_Base):
             self.bus.sync_write("Goal_Position", goal, normalize=False)
             self.goals.update(goal)
 
-    def set_p_gain(self, joints: list[str], p: int, steps: int = 4) -> None:
-        """Softer servos for sensing (session only). Lowered in `steps` with the goal re-aimed
-        each time. With torque on, lerobot keeps Lock=1, so the write lands in RAM and is
-        lost at power-off; it is read back to confirm, and close() restores it."""
-        # The re-aim scales err by P_old/P_new, which keeps the torque only if err is gravity
-        # sag. A joint resting on its end stop (goal clamped inside the range, err ~45) would
-        # get a goal ~4x further away and drive there as soon as it is lifted off the stop.
+    def set_p_gain(self, joints: list[str], p: int, steps: int = 4, reaim: bool = True) -> None:
+        """Softer servos for sensing (session only). Lowered in `steps`, with the goal re-aimed
+        each time (hold mode; in teleop the leader sets the goals every tick, so reaim=False).
+        With torque on, lerobot keeps Lock=1, so the write lands in RAM and is lost at
+        power-off; it is read back to confirm, and close() restores it."""
         pos = self._avg_pos()
-        bad = []
-        for j in joints:
-            lo, hi = self.ranges[j]
-            far = self.goals[j] is not None and abs(self.goals[j] - pos[j]) > 20
-            stop = j != "gripper" and (pos[j] < lo + 25 or pos[j] > hi - 25)
-            if far or stop:
-                bad.append(f"{j} (pos {pos[j]:.0f}, goal {self.goals[j]}, range {lo}-{hi})")
+        bad = soft_problems(pos, self.goals, self.ranges, joints)
         if bad:
             raise RuntimeError("--soft refused, nothing changed: " + "; ".join(bad) +
                                ". Hold the arm up in free space, away from its end stops, and restart.")
@@ -186,7 +197,8 @@ class ArmSource(_Base):
             for j in joints:
                 self.bus.write("P_Coefficient", j, step[j], normalize=False)
             self._p.update(step)
-            self._reaim(joints, before, step)
+            if reaim:
+                self._reaim(joints, before, step)
             time.sleep(0.15)
         back = self._r("P_Coefficient")
         bad = {j: back[j] for j in joints if back[j] != p}

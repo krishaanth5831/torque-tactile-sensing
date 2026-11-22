@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import matplotlib
 
@@ -49,7 +49,7 @@ class Live:
     def set_banner(self, text: str, color: str = "black") -> None:
         self.banner = (text, color)
 
-    def run(self, worker: Callable[["Live"], None], duration: float | None = None) -> None:
+    def run(self, worker: Callable[[Live], None], duration: float | None = None) -> None:
         """Start `worker(live)` in a thread and show the window until it closes
         (or `duration` seconds pass)."""
         if duration:

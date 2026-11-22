@@ -14,11 +14,14 @@ Modes:
     python scripts/touch_gui.py --fake                    # simulated arm + simulated finger pushes
     python scripts/touch_gui.py                           # real follower holds its pose: push it
     python scripts/touch_gui.py --soft 4                  # same, softer servos: finer touch
+    python scripts/touch_gui.py --teleop --soft 4 --poke  # pose it with the leader, hold the leader
+                                                          # still: it softens, then poke the follower
     python scripts/touch_gui.py --poke                    # accuracy test: double-click a spot on
                                                           # the model, poke it on the real arm
     python scripts/touch_gui.py --teleop                  # leader drives follower, push the follower
     python scripts/touch_gui.py --teleop --record         # record no-touch motion for fit_model.py
     python scripts/touch_gui.py --teleop --model models/load_model.json   # touch while MOVING
+    python scripts/touch_gui.py --replay data/poke_<stamp>.csv            # a recorded run, re-analysed
 
 Keys (window focused): R = re-learn the baseline now (don't touch while it learns).
 (R also toggles MuJoCo's floor reflection: harmless.)
@@ -43,6 +46,7 @@ from tactile.dynmodel import LoadModel
 from tactile.estimator import TouchEstimator
 from tactile.logger import DATA_DIR, CsvLogger
 from tactile.model import SO101Model
+from tactile.source import soft_problems
 from tactile.teleop import FakeLeader, LeaderArm, Teleop
 
 p = base_parser(__doc__)
@@ -52,44 +56,96 @@ p.add_argument("--model", default=None, help="LoadModel json from fit_model.py (
 p.add_argument("--record", action="store_true", help="label the log as no-touch motion for fit_model.py")
 p.add_argument("--torque-limit", type=int, default=500, help="follower Torque_Limit, 0..1000")
 p.add_argument("--soft", type=int, default=None, metavar="P",
-               help="hold mode: lower the servos' P gain to P (lerobot uses 16) while this runs. "
-                    "Softer = more deflection per newton = finer touch. Restored on exit")
+               help="lower the servos' P gain to P (lerobot uses 16) while this runs. Softer = more "
+                    "deflection per newton = finer touch. Hold mode: at start (arm must be off its end "
+                    "stops). Teleop: as soon as the follower is still and off its stops. Restored on exit")
 p.add_argument("--max-step", type=float, default=40, help="teleop: max goal change per tick, ticks")
 p.add_argument("--d-on", type=float, default=6.0, help="touch starts when the noise-weighted torque exceeds this")
 p.add_argument("--d-off", type=float, default=3.5, help="... and ends below this")
+p.add_argument("--dither", type=float, default=0.0, metavar="A",
+               help="shake each goal +-A ticks (try 4) so gear friction keeps moving instead of hiding light "
+                    "touches and leaving touches stuck on. Sensing uses the unshaken goal. Max 10")
+p.add_argument("--dither-hz", type=float, default=8.0, help="dither frequency (the window covers 2 periods)")
 p.add_argument("--poke", action="store_true",
                help="accuracy test: double-click the model where you will poke, poke the real arm there")
 p.add_argument("--no-truth", action="store_true", help="fake: hide the true-push arrow")
+p.add_argument("--replay", default=None, metavar="CSV",
+               help="play a recorded run back through the CURRENT touch code (no arm needed)")
+p.add_argument("--replay-speed", type=float, default=1.0)
 p.add_argument("--limp", action="store_true",
                help="never enable torque (mirror check: move the arm by hand). SUPPORT THE ARM")
 args = p.parse_args()
+if args.replay and (args.teleop or args.limp or args.fake or args.soft or args.dither or args.record):
+    p.error("--replay plays a recording back: no --teleop/--limp/--fake/--soft/--dither/--record")
 if args.limp and args.teleop:
     p.error("--limp and --teleop don't mix (teleop has to drive the follower)")
-if args.soft is not None and (args.teleop or args.limp):
-    p.error("--soft is for hold mode (in teleop a soft arm sags off the leader's pose)")
+if args.soft is not None and args.limp:
+    p.error("--soft and --limp don't mix (limp never turns torque on)")
 if args.soft is not None and not 1 <= args.soft <= 32:
     p.error("--soft P: 1..32 (lerobot 16, firmware default 32)")
+if not 0 <= args.dither <= 10:
+    p.error("--dither A: 0..10 ticks")
+if args.dither and args.limp:
+    p.error("--dither needs torque on (not --limp)")
+if args.dither and not 2 <= args.dither_hz <= 20:
+    p.error("--dither-hz: 2..20")
 
 J = config.JOINTS
-src = open_and_report(args, full=False, cartesian=args.fake, pushes=not args.record)  # record = no touch
+if args.replay:
+    from tactile.replay import ReplayEnded, ReplaySource
+    src = ReplaySource(args.replay, speed=args.replay_speed)
+    print(f"[tactile] {src.safety_report()['note']}")
+else:
+    ReplayEnded = ()                                       # nothing to catch
+    src = open_and_report(args, full=False, cartesian=args.fake, pushes=not args.record)  # record = no touch
 lm = LoadModel.load(args.model) if args.model else None
 if lm:
     print("[tactile] load model R^2:", {j: round(v, 2) for j, v in lm.r2.items()})
 t_build = time.time()
 loc = ContactLocalizer(SO101Model(ranges=src.ranges))
 print(f"[tactile] touch surface: {loc.s.n} points on {', '.join(loc.links)} ({time.time() - t_build:.1f} s)")
-est = TouchEstimator(SO101Model(ranges=src.ranges), lm, p_gain=args.soft or config.P_DEFAULT,
-                     d_on=args.d_on, d_off=args.d_off, localizer=loc)
+if args.soft is not None and not args.teleop:
+    # Hold mode keeps the pose it starts in, so check it BEFORE opening anything.
+    s0 = src.read()
+    bad = soft_problems(s0.pos, {}, src.ranges, J)
+    if bad:
+        src.close()
+        print("\n[tactile] --soft refused, nothing was changed:\n    " + "\n    ".join(bad) +
+              "\n  A joint on its end stop can't feel a push, and softening it is unsafe. Either put the"
+              "\n  arm in free space first, or let the leader pose it:\n"
+              f"      python scripts/touch_gui.py --teleop --soft {args.soft}" + (" --poke" if args.poke else ""),
+              file=sys.stderr)
+        sys.exit(2)
+soft_now = args.soft if (args.soft is not None and not args.teleop) else None   # teleop: later
+est = TouchEstimator(SO101Model(ranges=src.ranges), lm,
+                     p_gain=soft_now or (src.p_gain if args.replay and src.p_gain else config.P_DEFAULT),
+                     d_on=args.d_on, d_off=args.d_off, localizer=loc,
+                     **({"window_s": 2.0 / args.dither_hz, "settle_release": False} if args.dither else {}))
 leader = None
 if args.teleop:
     leader = FakeLeader() if args.fake else LeaderArm(args.leader_port)
 tp = Teleop(leader, src.ranges, max_step=args.max_step) if leader else None
 name = "free_motion" if args.record else "poke" if args.poke else "touch_gui"
-log = CsvLogger(name, J, extra=["state", "touch", "d", "contact_link", "cx", "cy", "cz", "spread_cm"]
-                + [f"z_{j}" for j in J], fake=args.fake)
+# nom_*: the unshaken goal the estimator uses (= goal_* without --dither); tgt_*: the poke
+# target (body + body-local point) so replay_eval.py can score every poke of this run later.
+class _NoLog:                       # a replay writes nothing
+    path = None
+
+    def write(self, *a, **k):
+        pass
+
+    def close(self):
+        pass
+
+
+log = _NoLog() if args.replay else CsvLogger(name, J, extra=["state", "touch", "d", "contact_link", "cx", "cy", "cz", "spread_cm"]
+                + [f"z_{j}" for j in J] + [f"nom_{j}" for j in J] + ["p_gain", "dither", "tgt_body", "tgt_x",
+                                                                    "tgt_y", "tgt_z"], fake=args.fake)
 
 lock = threading.Lock()
-shared = {"pos": None, "out": None, "truth": None, "hz": 0.0, "status": {}, "contact": None}
+shared = {"pos": None, "out": None, "truth": None, "hz": 0.0, "status": {}, "contact": None,
+          "soft": (f"soft P={args.soft}" if soft_now else
+                   f"soft P={args.soft} pending: hold the leader still" if args.soft else "")}
 stop = threading.Event()
 relearn = threading.Event()
 
@@ -97,34 +153,84 @@ relearn = threading.Event()
 worker_error = []
 
 
+def target_cols() -> dict:
+    """The current poke target for the CSV (empty outside --poke or before a double-click)."""
+    tgt = poke.get("target") if args.poke else None
+    if tgt is None:
+        return {}
+    b, local = tgt
+    return {"tgt_body": m.body(b).name, "tgt_x": round(float(local[0]), 5), "tgt_y": round(float(local[1]), 5),
+            "tgt_z": round(float(local[2]), 5)}
+
+
 def worker():
     try:
         _worker()
+    except ReplayEnded:
+        print("[tactile] replay finished")
     except BaseException as e:     # surfaced after the window closes; never die silently
         worker_error.append(e)
         raise
 
 
+def tri(x):
+    """Triangle wave, period 2 pi, -1..1: constant speed both ways."""
+    return 2 / np.pi * np.arcsin(np.sin(x))
+
+
+DITHER_PHASE = {j: k * 2 * np.pi / len(J) for k, j in enumerate(J)}     # joints out of step
+
+
 def _worker():
     if not args.limp:
         src.hold_here(J, args.torque_limit)
-        if args.soft is not None:
+        if soft_now is not None:
             print(f"[tactile] softening servos: P_Coefficient -> {args.soft} (restored on exit)")
             src.set_p_gain(J, args.soft)
+    soft_pending = args.soft is not None and soft_now is None
+    p_now = soft_now or config.P_DEFAULT
+    nominal = dict(src.goals)               # hold mode: the pose (re-aimed if softened)
+    if args.dither:
+        print(f"[tactile] dither: goals shake +-{args.dither:g} ticks at {args.dither_hz:g} Hz")
     rate = RateMeter()
     n = 0
     status = {}
     while not stop.is_set():
         s = src.read()
         if tp:
-            src.set_goal(tp.goals(s.t, s.pos))
+            nominal = {j: src.clamp(j, v) for j, v in tp.goals(s.t, s.pos).items()}
+        if args.dither and all(v is not None for v in nominal.values()):
+            shake = {}
+            for j in J:
+                lo, hi = src.ranges[j]
+                on_stop = s.pos[j] < lo + config.STOP_MARGIN_TICKS or s.pos[j] > hi - config.STOP_MARGIN_TICKS
+                a = 0.0 if on_stop else args.dither            # don't hammer a joint against its stop
+                shake[j] = nominal[j] + a * tri(2 * np.pi * args.dither_hz * s.t + DITHER_PHASE[j])
+            src.set_goal(shake)
+        elif tp:
+            src.set_goal(nominal)
         if n % 10 == 0 and not args.fake:
             status = {j: v for j, v in src.read_status().items() if v}
         n += 1
         if relearn.is_set():
             est.relearn()
             relearn.clear()
-        o = est.update(s.t, dict(src.goals), s.pos, s.load)
+        o = est.update(s.t, dict(nominal) if (tp or args.dither) else dict(src.goals), s.pos, s.load)
+        if soft_pending and o.state == "WATCHING":
+            # teleop: soften once the follower holds a pose clear of its stops. The leader keeps
+            # setting the goals, so no re-aim; a soft follower sags a little below the leader.
+            bad = soft_problems(s.pos, src.goals, src.ranges, J)
+            if bad:
+                with lock:
+                    shared["soft"] = f"soft P={args.soft} WAITING: " + bad[0].split(" (")[0]
+            else:
+                print(f"[tactile] follower still and clear of its stops: P_Coefficient -> {args.soft}")
+                src.set_p_gain(J, args.soft, reaim=False)
+                est.set_p_gain(args.soft)
+                p_now = args.soft
+                soft_pending = False
+                with lock:
+                    shared["soft"] = f"soft P={args.soft}"
         with lock:
             c = shared["contact"] if o.touching else None
             shared.update(pos=dict(s.pos), out=o, hz=rate.tick(), status=status,
@@ -133,7 +239,9 @@ def _worker():
                       "contact_link": c.link if c else "",
                       **({"cx": round(float(c.point[0]), 4), "cy": round(float(c.point[1]), 4),
                           "cz": round(float(c.point[2]), 4), "spread_cm": round(c.spread_cm, 2)} if c else {}),
-                      **{f"z_{j}": round(float(o.z[k]), 2) for k, j in enumerate(J)}})
+                      **{f"z_{j}": round(float(o.z[k]), 2) for k, j in enumerate(J)},
+                      **{f"nom_{j}": nominal.get(j, "") for j in J}, "p_gain": p_now, "dither": args.dither,
+                      **target_cols()})
 
 
 # ---------------------------------------------------------------------- drawing
@@ -142,7 +250,7 @@ m, d = vm.m, vm.d
 orig_rgba = m.geom_rgba.copy()
 visual = [g for g in range(m.ngeom) if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0]
 RED, CYAN, GREEN = np.array([1, .1, .1, 1]), np.array([0, .9, 1, .9]), np.array([.1, 1, .2, .9])
-STOP_MARGIN = 25     # ticks: closer than this to a calibrated end = probably resting on the stop
+STOP_MARGIN = config.STOP_MARGIN_TICKS   # closer than this to a calibrated end = on the stop
 
 
 def add_arrow(scn, a, b, rgba, width):
@@ -249,11 +357,18 @@ def draw(viewer, pos, o, c, truth, hz, status):
         _, tp_, tf = truth
         add_sphere(scn, tp_, 0.006, CYAN)
         force_arrow(scn, tp_, tf, CYAN)
+    if args.replay and getattr(src, "target", None) is not None:          # the recorded poke target
+        rb, rl = src.target
+        bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, rb)
+        if bid >= 0:
+            add_sphere(scn, d.xpos[bid] + d.xmat[bid].reshape(3, 3) @ rl, 0.007, GREEN)
     if args.poke and poke["target"] is not None:
         add_sphere(scn, target_world(poke["target"]), 0.007, GREEN)
 
-    mode = ("FAKE " if args.fake else "") + ("TELEOP" if args.teleop else "LIMP (mirror check)" if args.limp
-                                               else "HOLD") + (f"  soft P={args.soft}" if args.soft else "")
+    mode = ("FAKE " if args.fake else "REPLAY " if args.replay else "") + ("TELEOP" if args.teleop else "LIMP (mirror check)" if args.limp
+                                               else "HOLD") + (f"  {shared['soft']}" if shared["soft"] else "")
+    if args.dither:
+        mode += f"  dither +-{args.dither:g}t @{args.dither_hz:g}Hz"
     if args.record:
         mode += "  RECORDING no-touch motion"
     if args.poke:
@@ -375,6 +490,10 @@ finally:
         print(f"\nNext: python scripts/fit_model.py {log.path}")
 if worker_error:
     print(f"[tactile] the sensing loop crashed: {worker_error[0]!r} (traceback above)", file=sys.stderr)
+    if "status packet" in str(worker_error[0]):
+        print("[tactile] The follower's bus did not answer properly. Most likely another program is using it\n"
+              "          (lerobot-teleoperate / ~/teleop.sh, another touch_gui): close it and run again.\n"
+              "          Otherwise check the 12 V PSU and the USB cable, and just run it again.", file=sys.stderr)
 # Everything that matters is closed above (CSV, servo P gain + torque limit, ports). Exit
 # NOW: a viewer thread stuck inside MuJoCo's C++ (window not being drawn) would otherwise
 # hang interpreter shutdown, and glfw's atexit hook can segfault on a live render thread.
